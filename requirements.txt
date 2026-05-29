@@ -1,0 +1,13 @@
+sae-lens
+transformer-lens
+sae-dashboard
+circuitsvis
+plotly
+kaleido==0.2.1
+datasets
+tqdm
+pandas
+jupyterlab
+notebook
+ipykernel
+ipywidgets
