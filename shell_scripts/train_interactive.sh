@@ -21,18 +21,24 @@
 #
 set -euo pipefail
 
-CONTAINER="${CONTAINER:-sm_image}"
-SCRIPT="/home/smerrill@amd.com/efficient_sae/src/train_sae_FP16.py"
-OUTPUT_DIR="/home/smerrill@amd.com/efficient_sae/trained_models"
+# Resolve the project root from this script's location (shell_scripts/ -> project root)
+# so the script works regardless of where the repo lives. Override by exporting
+# PROJECT_ROOT before invoking.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+
+# Runs inside the pre-built ROCm container (no docker wrapper).
+PYTHON="${PYTHON:-python3}"
+SCRIPT="${SCRIPT:-${PROJECT_ROOT}/src/train_sae_FP16.py}"
+OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/trained_models}"
 
 B="\033[1m"; C="\033[36m"; G="\033[32m"; Y="\033[33m"; R="\033[0m"
 hr()  { echo -e "${C}────────────────────────────────────────────────────${R}"; }
 ask() { local v=$1 p=$2 d=$3; echo -en "${B}${p}${R} [${Y}${d}${R}]: "; read -r i; printf -v "$v" '%s' "${i:-$d}"; }
 
 # ── sanity check ─────────────────────────────────────────────────────────────
-if ! docker ps --filter "name=^/${CONTAINER}$" --format '{{.Names}}' | grep -qx "${CONTAINER}"; then
-  echo -e "Container '${CONTAINER}' is not running.  Run setup first:"
-  echo "  ./shell_scripts/setup_rocm_sae_env.sh"; exit 1
+if [[ ! -f "${SCRIPT}" ]]; then
+  echo -e "Training script not found at ${SCRIPT}"; exit 1
 fi
 
 hr; echo -e "${B}  SAE Training  —  ROCm + FP16${R}"; hr
@@ -145,7 +151,7 @@ run_layer() {
   local layer=$1 gpu=$2
   local hook="blocks.${layer}.hook_resid_post"
 
-  docker exec ${CONTAINER} python3 "${SCRIPT}" \
+  "${PYTHON}" "${SCRIPT}" \
     --model            "${MODEL}" \
     --dataset          "${DATASET}" \
     --dataset-config   "${DS_CFG}" \
@@ -193,7 +199,7 @@ else
 
   echo -e "\n${G}All ${#LAYERS[@]} jobs launched.${R}"
   echo "Monitor with:  tail -f ${OUTPUT_DIR}/log_${MODEL_SHORT}_layer<N>.txt"
-  echo "Or:            docker exec ${CONTAINER} rocm-smi --showuse"
+  echo "Or:            rocm-smi --showuse"
   wait
   echo -e "\n${G}All layers done.${R}"
 fi

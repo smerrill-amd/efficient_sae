@@ -15,6 +15,9 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SLURM_SCRIPT="${HERE}/train_FP16.slurm"
+# Project root = parent of this slurm_scripts/ dir. Override by exporting PROJECT_ROOT.
+PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${HERE}/.." && pwd)}"
+mkdir -p "${PROJECT_ROOT}/logs/slurm"
 
 LAYER="${LAYER:-}"        # empty = use mid-layer for each model
 TOKENS="${TOKENS:-200000000}"
@@ -61,7 +64,9 @@ for midx in ${MODELS}; do
 
     JOB_ID=$(sbatch \
       --job-name="${JOB_NAME}" \
+      --chdir="${PROJECT_ROOT}" \
       --export=ALL,\
+PROJECT_ROOT="${PROJECT_ROOT}",\
 MODEL="${MODEL}",\
 DATASET="${DATASET}",\
 DS_CFG="${DS_CFG}",\
@@ -86,4 +91,4 @@ done
 echo ""
 echo "Total jobs submitted: ${submitted}"
 echo "Monitor: squeue --me"
-echo "Logs:    /home/smerrill@amd.com/efficient_sae/logs/slurm/"
+echo "Logs:    ${PROJECT_ROOT}/logs/slurm/"

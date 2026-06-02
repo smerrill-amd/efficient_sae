@@ -24,14 +24,19 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
 #SBATCH --job-name=sae_all_layers
-#SBATCH --output=/home/smerrill@amd.com/efficient_sae/logs/slurm/%x_%A_%a.out
-#SBATCH --error=/home/smerrill@amd.com/efficient_sae/logs/slurm/%x_%A_%a.err
+# Log paths are relative to the submission directory (SLURM_SUBMIT_DIR), so submit
+# from the project root and make sure logs/slurm/ exists first.
+#SBATCH --output=logs/slurm/%x_%A_%a.out
+#SBATCH --error=logs/slurm/%x_%A_%a.err
 
 set -euo pipefail
 
+# Project root: prefer an explicit PROJECT_ROOT, else the dir sbatch was run from.
+PROJECT_ROOT="${PROJECT_ROOT:-${SLURM_SUBMIT_DIR:-$(pwd)}}"
+
 IMAGE="rocm/pytorch:rocm7.2.2_ubuntu24.04_py3.12_pytorch_release_2.7.1"
-SCRIPT="/home/smerrill@amd.com/efficient_sae/src/train_sae_FP16.py"
-OUTPUT_DIR="/home/smerrill@amd.com/efficient_sae/trained_models"
+SCRIPT="${SCRIPT:-${PROJECT_ROOT}/src/train_sae_FP16.py}"
+OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/trained_models}"
 
 # ── Model presets ─────────────────────────────────────────────────────────────
 MODEL_IDX="${MODEL_IDX:-1}"
@@ -94,7 +99,7 @@ docker run -d \
   --cap-add=SYS_PTRACE \
   --security-opt seccomp=unconfined \
   --shm-size 200G \
-  -v /home:/home \
+  -v "${PROJECT_ROOT}:${PROJECT_ROOT}" \
   -e ROCR_VISIBLE_DEVICES="${GPU_ENV}" \
   -e HIP_VISIBLE_DEVICES="${GPU_ENV}" \
   -e TOKENIZERS_PARALLELISM=false \
