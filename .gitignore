@@ -1,0 +1,15 @@
+# Secrets / local environment (never commit real keys)
+.env
+.env.*
+!.env.example
+*.netrc
+
+# Training artifacts
+trained_models/
+logs/
+wandb/
+
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/

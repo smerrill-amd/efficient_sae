@@ -5,6 +5,7 @@ circuitsvis
 plotly
 kaleido==0.2.1
 datasets
+wandb
 tqdm
 pandas
 jupyterlab

@@ -27,6 +27,23 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 
+# ---------------------------------------------------------------------------
+# Load secrets from .env (optional)
+# ---------------------------------------------------------------------------
+# W&B reads WANDB_API_KEY from the environment, so we source an optional,
+# gitignored .env at the project root (no interactive `wandb login` needed).
+# Best-effort: if .env is missing or empty, we just continue.
+ENV_FILE="${PROJECT_ROOT}/.env"
+if [[ -f "${ENV_FILE}" ]]; then
+  set -a                          # auto-export every var defined while sourcing
+  # shellcheck disable=SC1090
+  source "${ENV_FILE}"
+  set +a
+  if [[ -n "${WANDB_API_KEY:-}" ]]; then
+    echo "Loaded W&B credentials from ${ENV_FILE}"
+  fi
+fi
+
 # Runs inside the pre-built ROCm container (no docker wrapper).
 PYTHON="${PYTHON:-python3}"
 SCRIPT="${SCRIPT:-${PROJECT_ROOT}/src/train_sae_FP16.py}"
@@ -144,6 +161,62 @@ hr
 ask CONFIRM "Launch? (y/n)" "y"
 [[ "${CONFIRM,,}" != "y" ]] && echo "Aborted." && exit 0
 
+# ── Run directory ─────────────────────────────────────────────────────────────
+# One folder per run, auto-numbered, with everything needed to recover it:
+#   <output-dir>/<model>/run<N>/
+#     config.json        run-level hyperparameters (tokens, dtype, lr, arch, ...)
+#     logs/layer<L>.txt  per-layer training logs
+#     L0/ L1/ ... LN/    per-layer SAE checkpoints
+RUN_ROOT="${OUTPUT_DIR}/${MODEL_SHORT}"
+mkdir -p "${RUN_ROOT}"
+RUN_NUM=1
+while [[ -e "${RUN_ROOT}/run${RUN_NUM}" ]]; do RUN_NUM=$(( RUN_NUM + 1 )); done
+RUN_DIR="${RUN_ROOT}/run${RUN_NUM}"
+mkdir -p "${RUN_DIR}/logs"
+
+# Group every layer of this run together in W&B (Python uses the same scheme).
+export WANDB_RUN_GROUP="${MODEL_SHORT}/run${RUN_NUM}"
+
+# Architecture-specific sparsity field for the config file.
+if [[ "${ARCH}" == "topk" ]]; then
+  SPARSITY_JSON="\"k\": ${K}"
+else
+  SPARSITY_JSON="\"l1_coeff\": ${L1}"
+fi
+
+# Layers as a JSON array, e.g. [0, 1, 2].
+LAYERS_JSON=$(printf '%s, ' "${LAYERS[@]}"); LAYERS_JSON="[${LAYERS_JSON%, }]"
+
+cat > "${RUN_DIR}/config.json" <<EOF
+{
+  "model": "${MODEL}",
+  "model_short": "${MODEL_SHORT}",
+  "dataset": "${DATASET}",
+  "dataset_config": "${DS_CFG}",
+  "arch": "${ARCH}",
+  ${SPARSITY_JSON},
+  "d_in": ${D_IN},
+  "d_sae": ${D_SAE},
+  "expansion": $(( D_SAE / D_IN )),
+  "training_tokens": ${TOKENS},
+  "training_steps": ${TOTAL_STEPS},
+  "lr": "${LR}",
+  "lr_warm_up_steps": ${LR_WARM},
+  "lr_decay_steps": ${LR_DECAY},
+  "lr_scheduler": "constant",
+  "batch_size": ${BATCH},
+  "context_size": ${CTX},
+  "dtype": "${DTYPE}",
+  "layers": ${LAYERS_JSON},
+  "wandb_project": "${WANDB_PROJECT}",
+  "wandb_group": "${WANDB_RUN_GROUP}",
+  "created": "$(date +%Y%m%d_%H%M%S)"
+}
+EOF
+
+echo -e "\n${G}Run dir:${R}  ${RUN_DIR}"
+echo -e "${G}Config:${R}   ${RUN_DIR}/config.json"
+
 # ── Launch ────────────────────────────────────────────────────────────────────
 N_GPUS=8
 
@@ -170,16 +243,17 @@ run_layer() {
     --dtype            "${DTYPE}" \
     --device           "cuda:${gpu}" \
     --llm-device       "cuda:${gpu}" \
-    --output-dir       "${OUTPUT_DIR}" \
+    --run-dir          "${RUN_DIR}" \
     --wandb-project    "${WANDB_PROJECT}" \
     ${WANDB_FLAG}
 }
 
 if [[ "${#LAYERS[@]}" -eq 1 ]]; then
-  # Single layer — run interactively so output streams to terminal
+  # Single layer — stream to terminal and tee into the run's log folder.
   GPU="${GPU_INPUT:-0}"
-  echo -e "\n${G}Training layer ${LAYERS[0]} on cuda:${GPU}${R}"
-  run_layer "${LAYERS[0]}" "${GPU}"
+  LOG="${RUN_DIR}/logs/layer${LAYERS[0]}.txt"
+  echo -e "\n${G}Training layer ${LAYERS[0]} on cuda:${GPU}  (log: ${LOG})${R}"
+  run_layer "${LAYERS[0]}" "${GPU}" 2>&1 | tee "${LOG}"
 
 else
   # All layers — spawn in background, assign GPUs round-robin
@@ -191,14 +265,13 @@ else
     else
       gpu="${GPU_INPUT}"
     fi
-    LOG="${OUTPUT_DIR}/log_${MODEL_SHORT}_layer${layer}.txt"
-    mkdir -p "${OUTPUT_DIR}"
+    LOG="${RUN_DIR}/logs/layer${layer}.txt"
     echo -e "  Layer ${layer}  →  cuda:${gpu}  (log: ${LOG})"
     run_layer "${layer}" "${gpu}" > "${LOG}" 2>&1 &
   done
 
   echo -e "\n${G}All ${#LAYERS[@]} jobs launched.${R}"
-  echo "Monitor with:  tail -f ${OUTPUT_DIR}/log_${MODEL_SHORT}_layer<N>.txt"
+  echo "Monitor with:  tail -f ${RUN_DIR}/logs/layer<N>.txt"
   echo "Or:            rocm-smi --showuse"
   wait
   echo -e "\n${G}All layers done.${R}"

@@ -14,7 +14,9 @@ Run name encodes all key hyperparameters so you can identify any checkpoint at a
 
 import argparse
 import os
+import re
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -68,6 +70,60 @@ def build_run_name(args, d_sae: int) -> str:
     ts = datetime.now().strftime("%Y%m%d_%H%M")
 
     return f"{model_tag}__{hook_tag}__{arch_tag}__x{expansion}__{tokens_tag}__{dtype_tag}__{ts}"
+
+
+def layer_from_hook(hook_name: str):
+    """Extract the integer layer index from a hook like 'blocks.12.hook_resid_post'."""
+    m = re.search(r"blocks\.(\d+)\.", hook_name)
+    return int(m.group(1)) if m else None
+
+
+def _fmt_duration(seconds: float) -> str:
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m}m {s}s"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
+def configure_wandb_env(args, d_sae: int, run_dir: Path | None = None) -> None:
+    """Set WANDB_* env vars so runs are grouped and tagged for easy filtering.
+
+    SAELens calls wandb.init() with only project/entity/name/id, so group, tags,
+    job-type, and notes are picked up from the environment instead.
+    """
+    model_tag = args.model.split("/")[-1]
+    arch_tag = f"topk-k{args.k}" if args.arch == "topk" else f"relu-l1{args.l1_coeff}"
+    hook_tag = args.hook_name.replace("blocks.", "L")
+    for long, short in _HOOK_ABBREV.items():
+        hook_tag = hook_tag.replace(long, short)
+    expansion = d_sae // args.d_in
+    dtype_tag = _DTYPE_SHORT.get(args.dtype, args.dtype)
+    tokens_tag = f"{args.training_tokens // 1_000_000}Mt"
+
+    # Group every layer of a single run together. When a run directory is given
+    # (e.g. .../Llama-3.1-8B/run1) use "<model>/<run>"; otherwise fall back to
+    # grouping by model + architecture.
+    if run_dir is not None:
+        default_group = f"{run_dir.parent.name}/{run_dir.name}"
+    else:
+        default_group = f"{model_tag}__{arch_tag}"
+    os.environ.setdefault("WANDB_RUN_GROUP", default_group)
+    os.environ.setdefault("WANDB_JOB_TYPE", "train-sae")
+
+    tags = [model_tag, args.arch, arch_tag, hook_tag, f"x{expansion}", tokens_tag, dtype_tag]
+    os.environ.setdefault("WANDB_TAGS", ",".join(tags))
+
+    notes = (
+        f"{args.arch} SAE on {args.model} @ {args.hook_name} "
+        f"(d_sae={d_sae}, x{expansion}); dataset={args.dataset}"
+        + (f"[{args.dataset_config}]" if args.dataset_config else "")
+        + f"; {args.training_tokens:,} tokens, dtype={args.dtype}, lr={args.lr}"
+    )
+    os.environ.setdefault("WANDB_NOTES", notes)
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +228,10 @@ def parse_args() -> argparse.Namespace:
     out = p.add_argument_group("Output & Logging")
     out.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR,
                      help="Root directory for saved models")
+    out.add_argument("--run-dir", type=Path, default=None,
+                     help="Run directory (e.g. .../Llama-3.1-8B/run1). When set, "
+                          "this layer's checkpoint is saved to <run-dir>/L<layer>, "
+                          "overriding --output-dir/--run-name for the save path.")
     out.add_argument("--n-checkpoints", type=int, default=5,
                      help="Number of intermediate checkpoints to save")
     out.add_argument("--wandb-project", default="efficient_sae")
@@ -203,7 +263,16 @@ def main() -> None:
     lr_decay = args.lr_decay_steps or training_steps // 5
 
     run_name = args.run_name or build_run_name(args, d_sae)
-    checkpoint_path = str(args.output_dir / run_name)
+
+    # Save location: under a run directory as <run-dir>/L<layer> when --run-dir is
+    # given (so a run groups all layers + a config + logs), else the legacy
+    # <output-dir>/<run_name> layout.
+    layer = layer_from_hook(args.hook_name)
+    if args.run_dir is not None:
+        layer_tag = f"L{layer}" if layer is not None else run_name
+        checkpoint_path = str(args.run_dir / layer_tag)
+    else:
+        checkpoint_path = str(args.output_dir / run_name)
     Path(checkpoint_path).mkdir(parents=True, exist_ok=True)
 
     # ---- Print config summary -----------------------------------------------
@@ -247,6 +316,10 @@ def main() -> None:
             l1_warm_up_steps=l1_warm,
             **sae_base,
         )
+
+    # ---- W&B run organization (group / tags / notes via env) ----------------
+    if not args.no_wandb:
+        configure_wandb_env(args, d_sae, run_dir=args.run_dir)
 
     # ---- Logger config ------------------------------------------------------
     logger_cfg = LoggingConfig(
@@ -297,9 +370,15 @@ def main() -> None:
     cfg = LanguageModelSAERunnerConfig(**runner_kwargs)
 
     # ---- Train --------------------------------------------------------------
+    # SAELens renders live tqdm bars with ETA for the long phases (model load /
+    # dataset fast-forward / norm estimation / the "Training SAE" loop). We add
+    # wall-clock timing here for the total run.
+    print(f"Starting run — watch the 'Training SAE' tqdm bar for live ETA.\n")
+    start = time.monotonic()
     SAETrainingRunner(cfg).run()
+    elapsed = time.monotonic() - start
 
-    print(f"\nTraining complete.")
+    print(f"\nTraining complete in {_fmt_duration(elapsed)}.")
     print(f"Model saved to: {checkpoint_path}")
 
 
