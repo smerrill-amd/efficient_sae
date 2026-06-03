@@ -369,6 +369,22 @@ def main() -> None:
 
     cfg = LanguageModelSAERunnerConfig(**runner_kwargs)
 
+    # ---- Print the fully-resolved runner config -----------------------------
+    # Dump every field SAELens will actually use, so the exact run is recorded
+    # in the logs (and recoverable) before any heavy work starts.
+    print(f"\n{'='*64}")
+    print("  LanguageModelSAERunnerConfig (resolved)")
+    print(f"{'='*64}")
+    try:
+        cfg_dict = cfg.to_dict()
+    except Exception:
+        import dataclasses
+        cfg_dict = (dataclasses.asdict(cfg)
+                    if dataclasses.is_dataclass(cfg) else dict(vars(cfg)))
+    for key in sorted(cfg_dict):
+        print(f"  {key:<34} {cfg_dict[key]}")
+    print(f"{'='*64}\n")
+
     # ---- Train --------------------------------------------------------------
     # SAELens renders live tqdm bars with ETA for the long phases (model load /
     # dataset fast-forward / norm estimation / the "Training SAE" loop). We add
