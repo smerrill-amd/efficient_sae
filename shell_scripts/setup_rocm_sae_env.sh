@@ -37,6 +37,22 @@ else
   echo "No .env at ${ENV_FILE} (optional) — skipping credential load."
 fi
 
+# ---------------------------------------------------------------------------
+# Git identity (optional)
+# ---------------------------------------------------------------------------
+# The container's ~/.gitconfig is wiped on every rebuild, so we re-apply the
+# identity from .env (GIT_USER_NAME / GIT_USER_EMAIL) on each setup. This means
+# you never have to run `git config --global user.*` by hand again.
+if command -v git >/dev/null 2>&1; then
+  if [[ -n "${GIT_USER_NAME:-}" ]]; then
+    git config --global user.name "${GIT_USER_NAME}"
+  fi
+  if [[ -n "${GIT_USER_EMAIL:-}" ]]; then
+    git config --global user.email "${GIT_USER_EMAIL}"
+    echo "Configured git identity: ${GIT_USER_NAME:-?} <${GIT_USER_EMAIL}>"
+  fi
+fi
+
 REQ_FILE="${REQ_FILE:-${PROJECT_ROOT}/requirements.txt}"
 PYTHON="${PYTHON:-python3}"
 
