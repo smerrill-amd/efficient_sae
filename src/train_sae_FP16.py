@@ -1,15 +1,29 @@
 #!/usr/bin/env python3
 """
-train_sae_FP16.py — Train a Sparse Autoencoder (ReLU/TopK) on a language model.
+train_sae_FP16.py — Train Sparse Autoencoder(s) (ReLU/TopK/BatchTopK) on a language model.
+
+Two modes, selected with --sweep:
+
+  --sweep none   (default)  Train a single SAE at one hook. Uses SAETrainingRunner.
+
+  --sweep layers            Train one SAE per layer, all sharing ONE model and ONE
+                            forward pass per batch (MultiSAETrainingRunner). Pass
+                            --layers "0,4,8" or --layers all (with --n-layers).
+
+  --sweep k                 Train several SAEs at a single hook with different TopK
+                            k values (one model, one forward pass). Pass
+                            --k-values "32,64,128".
+
+For the sweep modes the model is loaded once and its activations are multiplexed to
+every SAE, so an "all layers" job costs ~1 model copy instead of N.
 
 Outputs are saved to:
-  <output-dir>/<run_name>/
-    sae_weights.safetensors
-    cfg.json
-    sparsity.safetensors   (if produced by SAELens)
+  <output-dir>/<run_name>/                 (single)
+  <run-dir>/L<layer>/                      (single, when --run-dir given)
+  <run-dir>/{checkpoints,output}/...       (sweep; per-SAE subdirs keyed by L<layer> or k<k>)
 
-Run name encodes all key hyperparameters so you can identify any checkpoint at a glance:
-  <model>__<hook>__<arch>__x<expansion>__<tokens>tok__<dtype>__<timestamp>
+Run name encodes the key hyperparameters so you can identify a run at a glance:
+  <model>__<hook|sweep>__<arch>__x<expansion>__<tokens>tok__<dtype>__<timestamp>
 """
 
 import argparse
@@ -26,6 +40,9 @@ from sae_lens import (
     SAETrainingRunner,
     StandardTrainingSAEConfig,
     TopKTrainingSAEConfig,
+    BatchTopKTrainingSAEConfig,
+    MultiSAETrainingRunner,
+    MultiSAETrainingRunnerConfig,
     LoggingConfig,
 )
 
@@ -52,6 +69,41 @@ _DTYPE_SHORT = {
 }
 
 
+def _arch_tag(args) -> str:
+    """Short architecture tag for run names / wandb tags."""
+    if args.arch == "topk":
+        return f"topk-k{args.k}"
+    if args.arch == "batchtopk":
+        return f"batchtopk-k{args.k}"
+    return f"relu-l1{args.l1_coeff}"
+
+
+def build_one_sae_cfg(args, d_sae: int, k, training_steps: int):
+    """Build a single TrainingSAEConfig for the chosen architecture.
+
+    `k` is taken as an explicit argument (rather than args.k) so the k-sweep can
+    vary it per SAE while sharing everything else.
+    """
+    base = dict(
+        d_in=args.d_in,
+        d_sae=d_sae,
+        apply_b_dec_to_input=args.apply_b_dec_to_input,
+        normalize_activations=args.normalize_activations,
+    )
+    if args.arch == "topk":
+        return TopKTrainingSAEConfig(
+            k=int(k), aux_loss_coefficient=args.aux_loss_coeff, **base
+        )
+    if args.arch == "batchtopk":
+        return BatchTopKTrainingSAEConfig(
+            k=int(k), aux_loss_coefficient=args.aux_loss_coeff, **base
+        )
+    l1_warm = args.l1_warm_up_steps or training_steps // 20
+    return StandardTrainingSAEConfig(
+        l1_coefficient=args.l1_coeff, l1_warm_up_steps=l1_warm, **base
+    )
+
+
 def build_run_name(args, d_sae: int) -> str:
     model_tag = args.model.split("/")[-1]
 
@@ -59,10 +111,7 @@ def build_run_name(args, d_sae: int) -> str:
     for long, short in _HOOK_ABBREV.items():
         hook_tag = hook_tag.replace(long, short)
 
-    if args.arch == "topk":
-        arch_tag = f"topk-k{args.k}"
-    else:
-        arch_tag = f"relu-l1{args.l1_coeff}"
+    arch_tag = _arch_tag(args)
 
     expansion = d_sae // args.d_in
     tokens_tag = f"{args.training_tokens // 1_000_000}Mt"
@@ -96,7 +145,7 @@ def configure_wandb_env(args, d_sae: int, run_dir: Path | None = None) -> None:
     job-type, and notes are picked up from the environment instead.
     """
     model_tag = args.model.split("/")[-1]
-    arch_tag = f"topk-k{args.k}" if args.arch == "topk" else f"relu-l1{args.l1_coeff}"
+    arch_tag = _arch_tag(args)
     hook_tag = args.hook_name.replace("blocks.", "L")
     for long, short in _HOOK_ABBREV.items():
         hook_tag = hook_tag.replace(long, short)
@@ -145,8 +194,10 @@ def parse_args() -> argparse.Namespace:
                     help="HuggingFace dataset path (e.g. HuggingFaceFW/fineweb-edu)")
     md.add_argument("--dataset-config", default=None,
                     help="HuggingFace dataset subset/config name (e.g. sample-10BT)")
-    md.add_argument("--hook-name", required=True,
-                    help="TransformerLens hook point (e.g. blocks.16.hook_resid_post)")
+    md.add_argument("--hook-name", default=None,
+                    help="TransformerLens hook point (e.g. blocks.16.hook_resid_post). "
+                         "Required for --sweep none/k; for --sweep layers it is built "
+                         "from --hook-template instead.")
     md.add_argument("--d-in", type=int, required=True,
                     help="Hidden dimension at the hook (e.g. 4096 for Llama-8B resid)")
     md.add_argument("--tokenized", action="store_true",
@@ -156,8 +207,9 @@ def parse_args() -> argparse.Namespace:
 
     # ---- SAE architecture ---------------------------------------------------
     arch = p.add_argument_group("SAE Architecture")
-    arch.add_argument("--arch", choices=["relu", "topk"], default="topk",
-                      help="SAE architecture: relu (L1 penalty) or topk (hard sparsity)")
+    arch.add_argument("--arch", choices=["relu", "topk", "batchtopk"], default="topk",
+                      help="SAE architecture: relu (L1 penalty), topk (per-token hard "
+                           "sparsity), or batchtopk (per-batch hard sparsity)")
     arch.add_argument("--d-sae", type=int, default=None,
                       help="SAE dictionary size. Overrides --dict-mult if set.")
     arch.add_argument("--dict-mult", type=int, default=8,
@@ -181,6 +233,22 @@ def parse_args() -> argparse.Namespace:
                          help="Number of active features per token")
     topk_g.add_argument("--aux-loss-coeff", type=float, default=1.0 / 32,
                          help="Dead-neuron auxiliary loss coefficient")
+
+    # ---- Multi-SAE sweep (shared model, one forward pass) -------------------
+    sw = p.add_argument_group("Multi-SAE sweep (one model, one forward pass per batch)")
+    sw.add_argument("--sweep", choices=["none", "layers", "k"], default="none",
+                    help="none: single SAE (default). layers: one SAE per layer in "
+                         "--layers. k: several SAEs at --hook-name with --k-values. "
+                         "Both sweep modes use MultiSAETrainingRunner (shared model).")
+    sw.add_argument("--layers", default=None,
+                    help="Sweep=layers: comma list of layer indices (e.g. '0,4,8') "
+                         "or 'all' (requires --n-layers).")
+    sw.add_argument("--n-layers", type=int, default=None,
+                    help="Total model layers, used to expand --layers all.")
+    sw.add_argument("--k-values", default=None,
+                    help="Sweep=k: comma list of TopK k values (e.g. '32,64,128').")
+    sw.add_argument("--hook-template", default="blocks.{layer}.hook_resid_post",
+                    help="Sweep=layers: hook pattern with a {layer} placeholder.")
 
     # ---- Training -----------------------------------------------------------
     tr = p.add_argument_group("Training")
@@ -223,6 +291,9 @@ def parse_args() -> argparse.Namespace:
                     help="Activation shuffle buffer depth (higher = better shuffle)")
     hw.add_argument("--store-batch-size", type=int, default=32,
                     help="LLM prompts per activation collection batch")
+    hw.add_argument("--compile-llm", action="store_true", default=False,
+                    help="torch.compile the shared LLM (sweep modes only; the model "
+                         "is shared so this is amortized across all SAEs)")
 
     # ---- Output & logging ---------------------------------------------------
     out = p.add_argument_group("Output & Logging")
@@ -236,6 +307,11 @@ def parse_args() -> argparse.Namespace:
                      help="Number of intermediate checkpoints to save")
     out.add_argument("--wandb-project", default="efficient_sae")
     out.add_argument("--wandb-entity", default=None)
+    out.add_argument("--wandb-log-frequency", type=int, default=30,
+                     help="Steps between wandb metric logs")
+    out.add_argument("--eval-every-n-wandb-logs", type=int, default=20,
+                     help="Run built-in evals every N wandb logs. In sweep modes evals "
+                          "run sequentially per SAE, so raise this when sweeping many SAEs.")
     out.add_argument("--no-wandb", action="store_true",
                      help="Disable Weights & Biases logging")
     out.add_argument("--seed", type=int, default=42)
@@ -249,15 +325,28 @@ def parse_args() -> argparse.Namespace:
 # Main
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    args = parse_args()
+def _dump_resolved_cfg(cfg, title: str) -> None:
+    """Print every field SAELens will actually use, so the exact run is recorded
+    in the logs (and recoverable) before any heavy work starts."""
+    print(f"\n{'='*64}")
+    print(f"  {title}")
+    print(f"{'='*64}")
+    try:
+        cfg_dict = cfg.to_dict()
+    except Exception:
+        import dataclasses
+        cfg_dict = (dataclasses.asdict(cfg)
+                    if dataclasses.is_dataclass(cfg) else dict(vars(cfg)))
+    for key in sorted(cfg_dict):
+        print(f"  {key:<34} {cfg_dict[key]}")
+    print(f"{'='*64}\n")
 
-    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-    if not torch.cuda.is_available():
-        print("WARNING: CUDA/ROCm not detected — training on CPU will be very slow.",
-              file=sys.stderr)
+# ---------------------------------------------------------------------------
+# Single-SAE training (SAETrainingRunner)
+# ---------------------------------------------------------------------------
 
+def run_single(args) -> None:
     d_sae = args.d_sae if args.d_sae else args.d_in * args.dict_mult
     training_steps = args.training_tokens // args.batch_size
     lr_decay = args.lr_decay_steps or training_steps // 5
@@ -281,7 +370,7 @@ def main() -> None:
     print(f"  model     {args.model}")
     print(f"  hook      {args.hook_name}  (d_in={args.d_in})")
     print(f"  arch      {args.arch}  |  d_sae={d_sae}  (x{d_sae // args.d_in})")
-    if args.arch == "topk":
+    if args.arch in ("topk", "batchtopk"):
         print(f"  k         {args.k}  |  aux_loss={args.aux_loss_coeff}")
     else:
         print(f"  l1_coeff  {args.l1_coeff}")
@@ -295,43 +384,21 @@ def main() -> None:
     print(f"  output    {checkpoint_path}")
     print(f"{'='*64}\n")
 
-    # ---- SAE config ---------------------------------------------------------
-    sae_base = dict(
-        d_in=args.d_in,
-        d_sae=d_sae,
-        apply_b_dec_to_input=args.apply_b_dec_to_input,
-        normalize_activations=args.normalize_activations,
-    )
-
-    if args.arch == "topk":
-        sae_cfg = TopKTrainingSAEConfig(
-            k=args.k,
-            aux_loss_coefficient=args.aux_loss_coeff,
-            **sae_base,
-        )
-    else:
-        l1_warm = args.l1_warm_up_steps or training_steps // 20
-        sae_cfg = StandardTrainingSAEConfig(
-            l1_coefficient=args.l1_coeff,
-            l1_warm_up_steps=l1_warm,
-            **sae_base,
-        )
+    sae_cfg = build_one_sae_cfg(args, d_sae, args.k, training_steps)
 
     # ---- W&B run organization (group / tags / notes via env) ----------------
     if not args.no_wandb:
         configure_wandb_env(args, d_sae, run_dir=args.run_dir)
 
-    # ---- Logger config ------------------------------------------------------
     logger_cfg = LoggingConfig(
         log_to_wandb=not args.no_wandb,
         wandb_project=args.wandb_project,
         wandb_entity=args.wandb_entity,
         run_name=run_name,
-        wandb_log_frequency=30,
-        eval_every_n_wandb_logs=20,
+        wandb_log_frequency=args.wandb_log_frequency,
+        eval_every_n_wandb_logs=args.eval_every_n_wandb_logs,
     )
 
-    # ---- Runner config ------------------------------------------------------
     runner_kwargs = dict(
         model_name=args.model,
         hook_name=args.hook_name,
@@ -368,34 +435,205 @@ def main() -> None:
         runner_kwargs["act_store_device"] = args.act_store_device
 
     cfg = LanguageModelSAERunnerConfig(**runner_kwargs)
+    _dump_resolved_cfg(cfg, "LanguageModelSAERunnerConfig (resolved)")
 
-    # ---- Print the fully-resolved runner config -----------------------------
-    # Dump every field SAELens will actually use, so the exact run is recorded
-    # in the logs (and recoverable) before any heavy work starts.
-    print(f"\n{'='*64}")
-    print("  LanguageModelSAERunnerConfig (resolved)")
-    print(f"{'='*64}")
-    try:
-        cfg_dict = cfg.to_dict()
-    except Exception:
-        import dataclasses
-        cfg_dict = (dataclasses.asdict(cfg)
-                    if dataclasses.is_dataclass(cfg) else dict(vars(cfg)))
-    for key in sorted(cfg_dict):
-        print(f"  {key:<34} {cfg_dict[key]}")
-    print(f"{'='*64}\n")
-
-    # ---- Train --------------------------------------------------------------
-    # SAELens renders live tqdm bars with ETA for the long phases (model load /
-    # dataset fast-forward / norm estimation / the "Training SAE" loop). We add
-    # wall-clock timing here for the total run.
-    print(f"Starting run — watch the 'Training SAE' tqdm bar for live ETA.\n")
+    print("Starting run — watch the 'Training SAE' tqdm bar for live ETA.\n")
     start = time.monotonic()
     SAETrainingRunner(cfg).run()
     elapsed = time.monotonic() - start
 
     print(f"\nTraining complete in {_fmt_duration(elapsed)}.")
     print(f"Model saved to: {checkpoint_path}")
+
+
+# ---------------------------------------------------------------------------
+# Multi-SAE sweep (MultiSAETrainingRunner — one model, one forward pass)
+# ---------------------------------------------------------------------------
+
+def _parse_int_list(spec: str) -> list[int]:
+    return [int(x) for x in spec.split(",") if x.strip() != ""]
+
+
+def run_multi(args) -> None:
+    d_sae = args.d_sae if args.d_sae else args.d_in * args.dict_mult
+    training_steps = args.training_tokens // args.batch_size
+    lr_decay = args.lr_decay_steps or training_steps // 5
+
+    # ---- Build the per-SAE configs and hook map -----------------------------
+    saes: dict = {}
+    hook_names: dict = {}
+
+    if args.sweep == "layers":
+        if not args.layers:
+            sys.exit("ERROR: --sweep layers requires --layers '0,4,8' or --layers all")
+        if args.layers.strip() == "all":
+            if not args.n_layers:
+                sys.exit("ERROR: --layers all requires --n-layers")
+            layers = list(range(args.n_layers))
+        else:
+            layers = _parse_int_list(args.layers)
+        for L in layers:
+            name = f"L{L}"
+            hook_names[name] = args.hook_template.format(layer=L)
+            saes[name] = build_one_sae_cfg(args, d_sae, args.k, training_steps)
+        sweep_tag = f"L{layers[0]}-{layers[-1]}-n{len(layers)}"
+        arch_tag = _arch_tag(args)
+        sweep_desc = f"layers={layers}  k={args.k}"
+    else:  # sweep == "k"
+        if not args.k_values:
+            sys.exit("ERROR: --sweep k requires --k-values '32,64,128'")
+        if not args.hook_name:
+            sys.exit("ERROR: --sweep k requires --hook-name")
+        ks = _parse_int_list(args.k_values)
+        layer = layer_from_hook(args.hook_name)
+        for kk in ks:
+            name = f"k{kk}"
+            hook_names[name] = args.hook_name
+            saes[name] = build_one_sae_cfg(args, d_sae, kk, training_steps)
+        sweep_tag = f"L{layer}-ksweep" if layer is not None else "ksweep"
+        arch_tag = f"{args.arch}-k[{min(ks)}-{max(ks)}]"
+        sweep_desc = f"hook={args.hook_name}  k_values={ks}"
+
+    # ---- Run name + save locations ------------------------------------------
+    model_tag = args.model.split("/")[-1]
+    expansion = d_sae // args.d_in
+    tokens_tag = f"{args.training_tokens // 1_000_000}Mt"
+    dtype_tag = _DTYPE_SHORT.get(args.dtype, args.dtype)
+    ts = datetime.now().strftime("%Y%m%d_%H%M")
+    run_name = args.run_name or (
+        f"{model_tag}__{sweep_tag}__{arch_tag}__x{expansion}__{tokens_tag}__{dtype_tag}__{ts}"
+    )
+
+    if args.run_dir is not None:
+        base = args.run_dir
+    else:
+        base = args.output_dir / run_name
+    output_path = str(base)
+    checkpoint_path = str(base / "checkpoints")
+    Path(output_path).mkdir(parents=True, exist_ok=True)
+
+    if args.tokenized:
+        print("NOTE: --tokenized is ignored in sweep modes (V1 multi-SAE runner has no "
+              "pretokenized-dataset support).", file=sys.stderr)
+
+    # ---- Print summary ------------------------------------------------------
+    print(f"\n{'='*64}")
+    print(f"  run       {run_name}")
+    print(f"  sweep     {args.sweep}  ({len(saes)} SAEs, shared model + forward pass)")
+    print(f"  model     {args.model}")
+    print(f"  arch      {args.arch}  |  d_sae={d_sae}  (x{expansion})")
+    print(f"  {sweep_desc}")
+    print(f"  SAEs      {', '.join(f'{n}->{hook_names[n]}' for n in saes)}")
+    print(f"  dataset   {args.dataset}"
+          + (f"  [{args.dataset_config}]" if args.dataset_config else ""))
+    print(f"  tokens    {args.training_tokens:,}  ({training_steps:,} steps)")
+    print(f"  dtype     {args.dtype}  |  lr={args.lr}  |  batch={args.batch_size}")
+    print(f"  device    {args.device}"
+          + (f"  llm={args.llm_device}" if args.llm_device else "")
+          + (f"  acts={args.act_store_device}" if args.act_store_device else ""))
+    print(f"  output    {output_path}")
+    print(f"{'='*64}\n")
+
+    # ---- W&B run organization (single run; metrics namespaced per SAE) -------
+    if not args.no_wandb:
+        if args.run_dir is not None:
+            default_group = f"{args.run_dir.parent.name}/{args.run_dir.name}"
+        else:
+            default_group = f"{model_tag}__{arch_tag}"
+        os.environ.setdefault("WANDB_RUN_GROUP", default_group)
+        os.environ.setdefault("WANDB_JOB_TYPE", "train-sae-sweep")
+        tags = [model_tag, args.arch, f"sweep-{args.sweep}", f"x{expansion}",
+                tokens_tag, dtype_tag]
+        os.environ.setdefault("WANDB_TAGS", ",".join(tags))
+        os.environ.setdefault(
+            "WANDB_NOTES",
+            f"multi-SAE {args.sweep} sweep on {args.model}: {sweep_desc}; "
+            f"d_sae={d_sae} (x{expansion}); {args.training_tokens:,} tokens, "
+            f"dtype={args.dtype}, lr={args.lr}",
+        )
+
+    logger_cfg = LoggingConfig(
+        log_to_wandb=not args.no_wandb,
+        wandb_project=args.wandb_project,
+        wandb_entity=args.wandb_entity,
+        run_name=run_name,
+        wandb_log_frequency=args.wandb_log_frequency,
+        eval_every_n_wandb_logs=args.eval_every_n_wandb_logs,
+    )
+
+    runner_kwargs = dict(
+        saes=saes,
+        hook_names=hook_names,
+        model_name=args.model,
+        dataset_path=args.dataset,
+        streaming=not args.no_streaming,
+        context_size=args.context_size,
+        lr=args.lr,
+        adam_beta1=args.adam_beta1,
+        adam_beta2=args.adam_beta2,
+        lr_scheduler_name=args.lr_scheduler,
+        lr_warm_up_steps=args.lr_warm_up_steps,
+        lr_decay_steps=lr_decay,
+        train_batch_size_tokens=args.batch_size,
+        n_batches_in_buffer=args.n_batches_in_buffer,
+        training_tokens=args.training_tokens,
+        store_batch_size_prompts=args.store_batch_size,
+        dead_feature_window=args.dead_feature_window,
+        feature_sampling_window=args.feature_sampling_window,
+        device=args.device,
+        seed=args.seed,
+        dtype=args.dtype,
+        autocast=args.autocast,
+        autocast_lm=args.autocast_lm,
+        compile_llm=args.compile_llm,
+        n_checkpoints=args.n_checkpoints,
+        checkpoint_path=checkpoint_path,
+        output_path=output_path,
+        save_final_checkpoint=True,
+        logger=logger_cfg,
+    )
+
+    if args.llm_device:
+        runner_kwargs["llm_device"] = args.llm_device
+    if args.act_store_device:
+        runner_kwargs["act_store_device"] = args.act_store_device
+
+    cfg = MultiSAETrainingRunnerConfig(**runner_kwargs)
+    _dump_resolved_cfg(cfg, "MultiSAETrainingRunnerConfig (resolved)")
+
+    print(f"Starting {args.sweep} sweep over {len(saes)} SAEs — model loaded once, "
+          "activations shared.\n")
+    start = time.monotonic()
+    MultiSAETrainingRunner(cfg).run()
+    elapsed = time.monotonic() - start
+
+    print(f"\nSweep complete in {_fmt_duration(elapsed)}.")
+    print(f"Outputs saved under: {output_path}")
+
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    args = parse_args()
+
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+    if not torch.cuda.is_available():
+        print("WARNING: CUDA/ROCm not detected — training on CPU will be very slow.",
+              file=sys.stderr)
+
+    if args.arch == "batchtopk" and args.normalize_activations == "constant_norm_rescale":
+        sys.exit("ERROR: batchtopk does not support normalize_activations="
+                 "'constant_norm_rescale'. Use none, expected_average_only_in, or layer_norm.")
+
+    if args.sweep == "none":
+        if not args.hook_name:
+            sys.exit("ERROR: --hook-name is required for --sweep none")
+        run_single(args)
+    else:
+        run_multi(args)
 
 
 if __name__ == "__main__":
