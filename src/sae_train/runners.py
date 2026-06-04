@@ -138,6 +138,8 @@ def run_single(args, policy: PrecisionPolicy) -> None:
         runner_kwargs["llm_device"] = args.llm_device
     if args.act_store_device:
         runner_kwargs["act_store_device"] = args.act_store_device
+    if args.no_save_final:
+        runner_kwargs["save_final_checkpoint"] = False
 
     cfg = LanguageModelSAERunnerConfig(**runner_kwargs)
     dump_resolved_cfg(cfg, "LanguageModelSAERunnerConfig (resolved)")
@@ -315,7 +317,7 @@ def run_multi(args, policy: PrecisionPolicy) -> None:
         n_checkpoints=args.n_checkpoints,
         checkpoint_path=checkpoint_path,
         output_path=output_path,
-        save_final_checkpoint=True,
+        save_final_checkpoint=not args.no_save_final,
         logger=logger_cfg,
     )
 

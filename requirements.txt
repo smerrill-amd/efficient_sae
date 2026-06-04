@@ -1,6 +1,11 @@
-sae-lens
-transformer-lens
-sae-dashboard
+# Pinned: the container is ephemeral and reinstalls these every login, and our
+# code (the train_sae_FP16.py timing profiler monkey-patch + the BatchTopK eval
+# loader in notebooks/eval_test.ipynb) is coupled to these internals. Unpinned,
+# a rebuild could pull a newer release and silently break that coupling.
+sae-lens==6.44.2
+sae-bench==0.6.0
+transformer-lens==2.17.0
+sae-dashboard==0.8.0
 circuitsvis
 plotly
 kaleido==0.2.1
