@@ -8,12 +8,19 @@ The trainer hot loop is exactly two operations per batch:
   2. trainer.step(batch)  -> per-SAE forward + backward + optimizer.
 We monkey-patch those seams with CUDA-synchronized timers to get a true
 wall-clock split between "LLM forward / activation generation" and "SAE
-training", plus an "other" bucket (norm-est, evals, logging, ckpt).
+training". We also time two costly non-hot-loop seams that would otherwise be
+dumped into the residual "other" bucket and dominate short runs:
+  3. load_model(...)              -> one-time LLM load onto the GPU.
+  4. SAETrainer.save_checkpoint   -> periodic SAE weights + optimizer dump to disk
+                                     (summed across SAEs in sweep modes).
+Whatever is left after subtracting all four is the residual "other" bucket
+(norm-est bookkeeping, evals, logging, per-step Python overhead).
 
 This is precision-agnostic: it times whatever the SAE forward/backward does,
 so it works unchanged for fp16/fp8/fp4.
 """
 
+import importlib
 import json
 import time
 from pathlib import Path
@@ -37,8 +44,11 @@ class TimingProfiler:
         self.log_wandb = log_wandb
         self.data_time = 0.0   # next(data_provider): LLM fwd + buffer refill/shuffle
         self.sae_time = 0.0    # SAETrainer.step summed over all SAEs
+        self.ckpt_time = 0.0   # SAETrainer.save_checkpoint (weights+optimizer -> disk)
+        self.model_load_time = 0.0  # one-time load_model(...) onto the GPU
         self.n_batches = 0     # batches pulled (incl. norm-estimate warmup)
         self.n_sae_steps = 0   # per-SAE step() calls
+        self.n_ckpts = 0       # save_checkpoint() calls (per-SAE in sweep modes)
         self._t_install = None
         self._wandb_defined = False
 
@@ -91,6 +101,56 @@ class TimingProfiler:
 
         SAETrainer.step = timed_step  # type: ignore[method-assign]
 
+        # --- checkpoint writes (SAE weights + optimizer state -> disk) -------
+        # Wrapping SAETrainer.save_checkpoint covers both single mode and sweep
+        # modes (MultiSAETrainer delegates to each per-SAE SAETrainer), so the
+        # per-SAE writes are summed and never double-counted.
+        orig_save = SAETrainer.save_checkpoint
+
+        def timed_save(trainer, *args, **kwargs):  # type: ignore[no-untyped-def]
+            prof._sync()
+            t0 = time.perf_counter()
+            out = orig_save(trainer, *args, **kwargs)
+            prof._sync()
+            prof.ckpt_time += time.perf_counter() - t0
+            prof.n_ckpts += 1
+            return out
+
+        SAETrainer.save_checkpoint = timed_save  # type: ignore[method-assign]
+
+        # --- one-time model load (HookedTransformer onto the GPU) ------------
+        self._patch_model_load()
+
+    def _patch_model_load(self) -> None:
+        """Time the one-time `load_model(...)` call in each runner module.
+
+        Both runners do `from sae_lens.load_model import load_model` at import
+        time, so we patch the name bound in each runner module's namespace
+        (not the original module) — that's the reference they actually call.
+        """
+        prof = self
+        for modname in ("sae_lens.llm_sae_training_runner",
+                        "sae_lens.multi_sae_training_runner"):
+            try:
+                mod = importlib.import_module(modname)
+            except Exception:
+                continue
+            orig = getattr(mod, "load_model", None)
+            if orig is None or getattr(orig, "_timed_by_profiler", False):
+                continue
+
+            def make_timed(orig_fn):
+                def timed_load(*args, **kwargs):
+                    t0 = time.perf_counter()
+                    model = orig_fn(*args, **kwargs)
+                    prof._sync()
+                    prof.model_load_time += time.perf_counter() - t0
+                    return model
+                timed_load._timed_by_profiler = True  # type: ignore[attr-defined]
+                return timed_load
+
+            mod.load_model = make_timed(orig)  # type: ignore[attr-defined]
+
     def _record_data(self, dt: float) -> None:
         """Accumulate one activation-batch's timing, then handle periodic
         reporting and the --profile-steps early stop. Shared by the single-hook
@@ -119,8 +179,9 @@ class TimingProfiler:
     def _stats(self, partial: bool) -> dict:
         """Snapshot the current breakdown as a flat, serializable dict."""
         wall = time.perf_counter() - self._t_install
-        tracked = self.data_time + self.sae_time
-        other = max(wall - tracked, 0.0)
+        compute = self.data_time + self.sae_time          # SAE training compute
+        known = compute + self.ckpt_time + self.model_load_time
+        other = max(wall - known, 0.0)
 
         def pct(x: float, denom: float) -> float:
             return 100.0 * x / denom if denom > 0 else 0.0
@@ -131,14 +192,19 @@ class TimingProfiler:
             "n_batches": self.n_batches,
             "n_sae_steps": self.n_sae_steps,
             "approx_n_saes": max(self.n_sae_steps // nb, 1),
+            "n_ckpts": self.n_ckpts,
             "forward_seconds": self.data_time,
             "sae_seconds": self.sae_time,
+            "checkpoint_seconds": self.ckpt_time,
+            "model_load_seconds": self.model_load_time,
             "other_seconds": other,
             "wall_seconds": wall,
-            "forward_pct_compute": pct(self.data_time, tracked),
-            "sae_pct_compute": pct(self.sae_time, tracked),
+            "forward_pct_compute": pct(self.data_time, compute),
+            "sae_pct_compute": pct(self.sae_time, compute),
             "forward_pct_wall": pct(self.data_time, wall),
             "sae_pct_wall": pct(self.sae_time, wall),
+            "checkpoint_pct_wall": pct(self.ckpt_time, wall),
+            "model_load_pct_wall": pct(self.model_load_time, wall),
             "other_pct_wall": pct(other, wall),
             "forward_ms_per_batch": 1000 * self.data_time / nb,
             "sae_ms_per_batch": 1000 * self.sae_time / nb,
@@ -152,13 +218,18 @@ class TimingProfiler:
         print(
             f"\n{'='*64}\n"
             f"  TIMING PROFILE ({tag}) — {s['n_batches']} batches, "
-            f"{s['n_sae_steps']} per-SAE steps (~{s['approx_n_saes']} SAEs)\n"
+            f"{s['n_sae_steps']} per-SAE steps (~{s['approx_n_saes']} SAEs), "
+            f"{s['n_ckpts']} ckpts\n"
             f"{'-'*64}"
         )
+        print(f"  model load (1x)       : {fmt_duration(s['model_load_seconds']):>10}  "
+              f"({'':>5}          {s['model_load_pct_wall']:5.1f}% wall)")
         print(f"  LLM forward / act-gen : {fmt_duration(s['forward_seconds']):>10}  "
               f"({s['forward_pct_compute']:5.1f}% compute | {s['forward_pct_wall']:5.1f}% wall)")
         print(f"  SAE train (fwd+bwd)   : {fmt_duration(s['sae_seconds']):>10}  "
               f"({s['sae_pct_compute']:5.1f}% compute | {s['sae_pct_wall']:5.1f}% wall)")
+        print(f"  checkpoint I/O        : {fmt_duration(s['checkpoint_seconds']):>10}  "
+              f"({'':>5}          {s['checkpoint_pct_wall']:5.1f}% wall)")
         print(f"  other (norm/eval/log) : {fmt_duration(s['other_seconds']):>10}  "
               f"({'':>5}          {s['other_pct_wall']:5.1f}% wall)")
         print(f"  wall                  : {fmt_duration(s['wall_seconds']):>10}")
@@ -210,6 +281,8 @@ class TimingProfiler:
                 "profile/sae_pct_compute": stats["sae_pct_compute"],
                 "profile/cumulative_forward_seconds": stats["forward_seconds"],
                 "profile/cumulative_sae_seconds": stats["sae_seconds"],
+                "profile/cumulative_checkpoint_seconds": stats["checkpoint_seconds"],
+                "profile/model_load_seconds": stats["model_load_seconds"],
             },
             commit=False,
         )

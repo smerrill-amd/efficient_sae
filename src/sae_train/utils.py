@@ -33,7 +33,9 @@ def arch_tag(args) -> str:
         return f"topk-k{args.k}"
     if args.arch == "batchtopk":
         return f"batchtopk-k{args.k}"
-    return f"relu-l1{args.l1_coeff}"
+    if args.arch == "jumprelu":
+        return f"jumprelu-l0{args.l0_coeff}"
+    return f"standard-l1{args.l1_coeff}"  # standard / relu
 
 
 def build_run_name(args, d_sae: int) -> str:

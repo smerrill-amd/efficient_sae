@@ -40,9 +40,13 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
 
     # ---- SAE architecture (dtype args added by the precision policy) --------
     arch = p.add_argument_group("SAE Architecture")
-    arch.add_argument("--arch", choices=["relu", "topk", "batchtopk"], default="topk",
-                      help="SAE architecture: relu (L1 penalty), topk (per-token hard "
-                           "sparsity), or batchtopk (per-batch hard sparsity)")
+    arch.add_argument("--arch",
+                      choices=["relu", "standard", "topk", "batchtopk", "jumprelu"],
+                      default="topk",
+                      help="SAE architecture: standard/relu (L1 penalty; 'relu' is a "
+                           "legacy alias for 'standard'), topk (per-token hard sparsity), "
+                           "batchtopk (per-batch hard sparsity), or jumprelu (learned "
+                           "per-feature threshold with an L0 penalty)")
     arch.add_argument("--d-sae", type=int, default=None,
                       help="SAE dictionary size. Overrides --dict-mult if set.")
     arch.add_argument("--dict-mult", type=int, default=8,
@@ -53,19 +57,26 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
                       default="expected_average_only_in")
     arch.add_argument("--apply-b-dec-to-input", action="store_true", default=False)
 
-    # ReLU-specific
-    relu_g = p.add_argument_group("ReLU SAE (ignored for topk)")
+    # Standard / ReLU-specific
+    relu_g = p.add_argument_group("Standard / ReLU SAE (ignored for topk/batchtopk/jumprelu)")
     relu_g.add_argument("--l1-coeff", type=float, default=5.0,
                         help="L1 sparsity coefficient")
     relu_g.add_argument("--l1-warm-up-steps", type=int, default=0,
                         help="Steps to ramp L1 from 0 (0 = 5%% of total steps)")
 
-    # TopK-specific
-    topk_g = p.add_argument_group("TopK SAE (ignored for relu)")
+    # TopK / BatchTopK-specific
+    topk_g = p.add_argument_group("TopK / BatchTopK SAE (ignored for standard/jumprelu)")
     topk_g.add_argument("--k", type=int, default=100,
                          help="Number of active features per token")
     topk_g.add_argument("--aux-loss-coeff", type=float, default=1.0 / 32,
                          help="Dead-neuron auxiliary loss coefficient")
+
+    # JumpReLU-specific
+    jr_g = p.add_argument_group("JumpReLU SAE (ignored for other archs)")
+    jr_g.add_argument("--l0-coeff", type=float, default=1.0,
+                      help="L0 sparsity penalty coefficient")
+    jr_g.add_argument("--l0-warm-up-steps", type=int, default=0,
+                      help="Steps to ramp the L0 penalty from 0 (0 = 5%% of total steps)")
 
     # ---- Multi-SAE sweep (shared model, one forward pass) -------------------
     sw = p.add_argument_group("Multi-SAE sweep (one model, one forward pass per batch)")
@@ -154,7 +165,12 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
                           "this layer's checkpoint is saved to <run-dir>/L<layer>, "
                           "overriding --output-dir/--run-name for the save path.")
     out.add_argument("--n-checkpoints", type=int, default=5,
-                     help="Number of intermediate checkpoints to save")
+                     help="Number of intermediate checkpoints to save (0 disables them)")
+    out.add_argument("--no-save-final", action="store_true", default=False,
+                     help="Do not save the final SAE at the end of training. Useful for "
+                          "throughput benchmarks where you only care about timing. (In "
+                          "sweep modes the final SAE is saved by default; single mode does "
+                          "not save a final checkpoint by default either way.)")
     out.add_argument("--wandb-project", default="efficient_sae")
     out.add_argument("--wandb-entity", default=None)
     out.add_argument("--wandb-log-frequency", type=int, default=30,

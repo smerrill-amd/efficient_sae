@@ -168,6 +168,7 @@ TOKENS=500000000
 BATCH=2048
 CTX=1024
 DTYPE=bfloat16
+SAE_DTYPE="${SAE_DTYPE:-bfloat16}"   # SAE weight dtype: bf16 = native bf16 training (no GradScaler)
 LR_WARM=0
 TOTAL_STEPS=$(( TOKENS / BATCH ))
 LR_DECAY=$(( TOTAL_STEPS / 5 ))
@@ -192,7 +193,7 @@ printf "  %-18s %s\n" "LR:"        "${LR}  warmup=${LR_WARM}  decay=${LR_DECAY} 
 printf "  %-18s %s\n" "Batch/ctx:" "${BATCH} tokens / ${CTX} ctx"
 printf "  %-18s %s\n" "Tokens:"    "${TOKENS}  (${TOTAL_STEPS} steps)"
 printf "  %-18s %s\n" "GPU:"       "cuda:${GPU}"
-printf "  %-18s %s\n" "dtype:"     "${DTYPE}"
+printf "  %-18s %s\n" "dtype:"     "act=${DTYPE}  sae=${SAE_DTYPE}"
 printf "  %-18s %s\n" "W&B:"       "${WANDB_PROJECT}"
 hr
 if [[ "${SWEEP}" != "none" ]]; then
@@ -277,6 +278,7 @@ COMMON=(
   --context-size     "${CTX}"
   --training-tokens  "${TOKENS}"
   --dtype            "${DTYPE}"
+  --sae-dtype        "${SAE_DTYPE}"
   --device           "cuda:${GPU}"
   --llm-device       "cuda:${GPU}"
   --run-dir          "${RUN_DIR}"

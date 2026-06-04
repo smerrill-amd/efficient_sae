@@ -72,6 +72,8 @@ def run_single(args, policy: PrecisionPolicy) -> None:
     print(f"  arch      {args.arch}  |  d_sae={d_sae}  (x{d_sae // args.d_in})")
     if args.arch in ("topk", "batchtopk"):
         print(f"  k         {args.k}  |  aux_loss={args.aux_loss_coeff}")
+    elif args.arch == "jumprelu":
+        print(f"  l0_coeff  {args.l0_coeff}")
     else:
         print(f"  l1_coeff  {args.l1_coeff}")
     print(f"  dataset   {args.dataset}"

@@ -36,6 +36,7 @@ from sae_lens import (
     StandardTrainingSAEConfig,
     TopKTrainingSAEConfig,
     BatchTopKTrainingSAEConfig,
+    JumpReLUTrainingSAEConfig,
 )
 
 from sae_train.cli import build_parser
@@ -75,6 +76,7 @@ class FP16Policy(PrecisionPolicy):
             d_in=args.d_in,
             d_sae=d_sae,
             dtype=args.sae_dtype,
+            device=args.device,
             apply_b_dec_to_input=args.apply_b_dec_to_input,
             normalize_activations=args.normalize_activations,
         )
@@ -86,6 +88,12 @@ class FP16Policy(PrecisionPolicy):
             return BatchTopKTrainingSAEConfig(
                 k=int(k), aux_loss_coefficient=args.aux_loss_coeff, **base
             )
+        if args.arch == "jumprelu":
+            l0_warm = args.l0_warm_up_steps or training_steps // 20
+            return JumpReLUTrainingSAEConfig(
+                l0_coefficient=args.l0_coeff, l0_warm_up_steps=l0_warm, **base
+            )
+        # standard / relu (L1 penalty)
         l1_warm = args.l1_warm_up_steps or training_steps // 20
         return StandardTrainingSAEConfig(
             l1_coefficient=args.l1_coeff, l1_warm_up_steps=l1_warm, **base
