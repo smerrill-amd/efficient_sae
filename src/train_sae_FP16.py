@@ -87,6 +87,7 @@ def build_one_sae_cfg(args, d_sae: int, k, training_steps: int):
     base = dict(
         d_in=args.d_in,
         d_sae=d_sae,
+        dtype=args.sae_dtype,
         apply_b_dec_to_input=args.apply_b_dec_to_input,
         normalize_activations=args.normalize_activations,
     )
@@ -125,6 +126,31 @@ def layer_from_hook(hook_name: str):
     """Extract the integer layer index from a hook like 'blocks.12.hook_resid_post'."""
     m = re.search(r"blocks\.(\d+)\.", hook_name)
     return int(m.group(1)) if m else None
+
+
+def maybe_load_dataset(args):
+    """Pre-load the HF dataset when a config/subset name is given.
+
+    SAELens only stores `dataset_path` and calls `load_dataset(path, split="train",
+    streaming=...)` with no `name=` argument, so datasets that REQUIRE a config
+    (e.g. allenai/c4 needs 'en') can't be loaded through config alone. When
+    --dataset-config is set we load it here and hand the dataset object to the
+    runner via `override_dataset`. Returns None when no config is given, so the
+    default in-runner loading path is used.
+    """
+    if not args.dataset_config:
+        return None
+    from datasets import load_dataset
+
+    print(f"Pre-loading dataset {args.dataset} [{args.dataset_config}] "
+          f"(streaming={not args.no_streaming}) to pass config name through.")
+    return load_dataset(
+        args.dataset,
+        name=args.dataset_config,
+        split="train",
+        streaming=not args.no_streaming,
+        trust_remote_code=True,
+    )
 
 
 def _fmt_duration(seconds: float) -> str:
@@ -219,6 +245,16 @@ def parse_args() -> argparse.Namespace:
                                 "constant_norm_rescale", "layer_norm"],
                       default="expected_average_only_in")
     arch.add_argument("--apply-b-dec-to-input", action="store_true", default=False)
+    arch.add_argument("--sae-dtype", default="float32",
+                      choices=["bfloat16", "float16", "float32"],
+                      help="Dtype of the SAE weights + optimizer. Separate from "
+                           "--dtype (the activation/buffer dtype). Default float32 is "
+                           "the robust recipe: autocast still runs matmuls in bf16 "
+                           "(fast, low activation memory) while keeping fp32 master "
+                           "weights + a working GradScaler. Set bfloat16 to roughly "
+                           "halve per-SAE memory when cramming many layers onto one "
+                           "GPU — note this disables the SAE-forward autocast/GradScaler "
+                           "(they have no bf16 kernel), so weights train natively in bf16.")
 
     # ReLU-specific
     relu_g = p.add_argument_group("ReLU SAE (ignored for topk)")
@@ -291,6 +327,12 @@ def parse_args() -> argparse.Namespace:
                     help="Activation shuffle buffer depth (higher = better shuffle)")
     hw.add_argument("--store-batch-size", type=int, default=32,
                     help="LLM prompts per activation collection batch")
+    hw.add_argument("--n-batches-for-norm-estimate", type=int, default=50,
+                    help="Batches used to estimate the activation-norm scaling factor. "
+                         "SAELens caches ALL of these on-device before training starts, "
+                         "and in sweep modes each batch holds every hook — so the default "
+                         "of 1000 can stage hundreds of GiB. Lowering this avoids an OOM "
+                         "during norm estimation.")
     hw.add_argument("--compile-llm", action="store_true", default=False,
                     help="torch.compile the shared LLM (sweep modes only; the model "
                          "is shared so this is amortized across all SAEs)")
@@ -377,7 +419,7 @@ def run_single(args) -> None:
     print(f"  dataset   {args.dataset}"
           + (f"  [{args.dataset_config}]" if args.dataset_config else ""))
     print(f"  tokens    {args.training_tokens:,}  ({training_steps:,} steps)")
-    print(f"  dtype     {args.dtype}  |  lr={args.lr}  |  batch={args.batch_size}")
+    print(f"  dtype     act={args.dtype}  sae={args.sae_dtype}  |  lr={args.lr}  |  batch={args.batch_size}")
     print(f"  device    {args.device}"
           + (f"  llm={args.llm_device}" if args.llm_device else "")
           + (f"  acts={args.act_store_device}" if args.act_store_device else ""))
@@ -399,6 +441,12 @@ def run_single(args) -> None:
         eval_every_n_wandb_logs=args.eval_every_n_wandb_logs,
     )
 
+    # bf16 SAE weights are incompatible with the AMP GradScaler that SAELens
+    # enables whenever autocast=True (its unscale step has no bf16 kernel, and
+    # loss scaling is meaningless for bf16). So disable the SAE-forward autocast
+    # when weights are bf16 — they already compute in bf16 natively.
+    sae_autocast = args.autocast and args.sae_dtype != "bfloat16"
+
     runner_kwargs = dict(
         model_name=args.model,
         hook_name=args.hook_name,
@@ -417,12 +465,13 @@ def run_single(args) -> None:
         n_batches_in_buffer=args.n_batches_in_buffer,
         training_tokens=args.training_tokens,
         store_batch_size_prompts=args.store_batch_size,
+        n_batches_for_norm_estimate=args.n_batches_for_norm_estimate,
         dead_feature_window=args.dead_feature_window,
         feature_sampling_window=args.feature_sampling_window,
         device=args.device,
         seed=args.seed,
         dtype=args.dtype,
-        autocast=args.autocast,
+        autocast=sae_autocast,
         autocast_lm=args.autocast_lm,
         n_checkpoints=args.n_checkpoints,
         checkpoint_path=checkpoint_path,
@@ -437,9 +486,11 @@ def run_single(args) -> None:
     cfg = LanguageModelSAERunnerConfig(**runner_kwargs)
     _dump_resolved_cfg(cfg, "LanguageModelSAERunnerConfig (resolved)")
 
+    override_dataset = maybe_load_dataset(args)
+
     print("Starting run — watch the 'Training SAE' tqdm bar for live ETA.\n")
     start = time.monotonic()
-    SAETrainingRunner(cfg).run()
+    SAETrainingRunner(cfg, override_dataset=override_dataset).run()
     elapsed = time.monotonic() - start
 
     print(f"\nTraining complete in {_fmt_duration(elapsed)}.")
@@ -527,7 +578,7 @@ def run_multi(args) -> None:
     print(f"  dataset   {args.dataset}"
           + (f"  [{args.dataset_config}]" if args.dataset_config else ""))
     print(f"  tokens    {args.training_tokens:,}  ({training_steps:,} steps)")
-    print(f"  dtype     {args.dtype}  |  lr={args.lr}  |  batch={args.batch_size}")
+    print(f"  dtype     act={args.dtype}  sae={args.sae_dtype}  |  lr={args.lr}  |  batch={args.batch_size}")
     print(f"  device    {args.device}"
           + (f"  llm={args.llm_device}" if args.llm_device else "")
           + (f"  acts={args.act_store_device}" if args.act_store_device else ""))
@@ -561,6 +612,12 @@ def run_multi(args) -> None:
         eval_every_n_wandb_logs=args.eval_every_n_wandb_logs,
     )
 
+    # bf16 SAE weights are incompatible with the AMP GradScaler that SAELens
+    # enables whenever autocast=True (its unscale step has no bf16 kernel, and
+    # loss scaling is meaningless for bf16). So disable the SAE-forward autocast
+    # when weights are bf16 — they already compute in bf16 natively.
+    sae_autocast = args.autocast and args.sae_dtype != "bfloat16"
+
     runner_kwargs = dict(
         saes=saes,
         hook_names=hook_names,
@@ -578,12 +635,13 @@ def run_multi(args) -> None:
         n_batches_in_buffer=args.n_batches_in_buffer,
         training_tokens=args.training_tokens,
         store_batch_size_prompts=args.store_batch_size,
+        n_batches_for_norm_estimate=args.n_batches_for_norm_estimate,
         dead_feature_window=args.dead_feature_window,
         feature_sampling_window=args.feature_sampling_window,
         device=args.device,
         seed=args.seed,
         dtype=args.dtype,
-        autocast=args.autocast,
+        autocast=sae_autocast,
         autocast_lm=args.autocast_lm,
         compile_llm=args.compile_llm,
         n_checkpoints=args.n_checkpoints,
@@ -601,10 +659,12 @@ def run_multi(args) -> None:
     cfg = MultiSAETrainingRunnerConfig(**runner_kwargs)
     _dump_resolved_cfg(cfg, "MultiSAETrainingRunnerConfig (resolved)")
 
+    override_dataset = maybe_load_dataset(args)
+
     print(f"Starting {args.sweep} sweep over {len(saes)} SAEs — model loaded once, "
           "activations shared.\n")
     start = time.monotonic()
-    MultiSAETrainingRunner(cfg).run()
+    MultiSAETrainingRunner(cfg, override_dataset=override_dataset).run()
     elapsed = time.monotonic() - start
 
     print(f"\nSweep complete in {_fmt_duration(elapsed)}.")

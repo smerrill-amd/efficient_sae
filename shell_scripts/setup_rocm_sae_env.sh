@@ -53,6 +53,20 @@ if command -v git >/dev/null 2>&1; then
   fi
 fi
 
+# ---------------------------------------------------------------------------
+# Ensure tmux is installed
+# ---------------------------------------------------------------------------
+# The container is ephemeral, so tmux disappears on rebuild. Install it each
+# setup so detachable training sessions (tmux_train.sh / bare `tmux`) always work.
+if ! command -v tmux >/dev/null 2>&1; then
+  echo "tmux not found — installing..."
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -qq && apt-get install -y -qq tmux
+  else
+    echo "  WARNING: could not auto-install tmux (no apt-get)."
+  fi
+fi
+
 REQ_FILE="${REQ_FILE:-${PROJECT_ROOT}/requirements.txt}"
 PYTHON="${PYTHON:-python3}"
 

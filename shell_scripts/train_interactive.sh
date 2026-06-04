@@ -45,6 +45,18 @@ PYTHON="${PYTHON:-python3}"
 SCRIPT="${SCRIPT:-${PROJECT_ROOT}/src/train_sae_FP16.py}"
 OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/trained_models}"
 
+# Reduce allocator fragmentation (the OOM logs show GiBs "reserved but unallocated").
+export PYTORCH_HIP_ALLOC_CONF="${PYTORCH_HIP_ALLOC_CONF:-expandable_segments:True}"
+
+# Memory knobs for sweep modes (overridable via env). The multi-SAE activation
+# buffer holds activations for EVERY hook, so it grows with the number of layers.
+# Shrinking the buffer (NB_BUF) and the LLM forward batch (STORE_BS) keeps it
+# small enough to stay ON the GPU — fast path. Only set ACT_STORE_DEVICE=cpu as a
+# last-resort fallback if you still OOM (modest slowdown from CPU<->GPU copies).
+ACT_STORE_DEVICE="${ACT_STORE_DEVICE:-gpu}"
+NB_BUF="${NB_BUF:-8}"
+STORE_BS="${STORE_BS:-8}"
+
 B="\033[1m"; C="\033[36m"; G="\033[32m"; Y="\033[33m"; R="\033[0m"
 hr()  { echo -e "${C}────────────────────────────────────────────────────${R}"; }
 ask() { local v=$1 p=$2 d=$3; echo -en "${B}${p}${R} [${Y}${d}${R}]: "; read -r i; printf -v "$v" '%s' "${i:-$d}"; }
@@ -60,13 +72,13 @@ hr; echo -e "${B}  SAE Sweep  —  TopK / BatchTopK on resid_post${R}"; hr
 echo -e "\n${B}Model:${R}"
 echo "  1) Qwen3-8B       blocks.24  d_sae=65536   lr=3e-4   (FineWeb-Edu)"
 echo "  2) Llama-3.1-8B   blocks.20  d_sae=131072  lr=2e-4   (FineWeb-Edu)"
-echo "  3) gemma-3-4b     blocks.23  d_sae=16*d_in lr=3e-4   (C4)"
+  echo "  3) gemma-3-4b-pt  blocks.23  d_sae=16*d_in lr=3e-4   (C4)"
 ask MODEL_CHOICE "Model" "1"
 
 case "${MODEL_CHOICE}" in
   1) MODEL="Qwen/Qwen3-8B";          D_IN=4096; N_LAYERS=36; HOOK_LAYER=24; D_SAE=65536;          LR=3e-4; DATASET="HuggingFaceFW/fineweb-edu"; DS_CFG="sample-10BT" ;;
   2) MODEL="meta-llama/Llama-3.1-8B"; D_IN=4096; N_LAYERS=32; HOOK_LAYER=20; D_SAE=131072;         LR=2e-4; DATASET="HuggingFaceFW/fineweb-edu"; DS_CFG="sample-10BT" ;;
-  3) MODEL="google/gemma-3-4b";      D_IN=2560; N_LAYERS=34; HOOK_LAYER=23; D_SAE=$(( 16 * 2560 )); LR=3e-4; DATASET="allenai/c4";                DS_CFG="en" ;;
+  3) MODEL="google/gemma-3-4b-pt";   D_IN=2560; N_LAYERS=34; HOOK_LAYER=23; D_SAE=$(( 16 * 2560 )); LR=3e-4; DATASET="allenai/c4";                DS_CFG="en" ;;
   *) echo "Invalid."; exit 1 ;;
 esac
 MODEL_SHORT="${MODEL##*/}"
@@ -114,8 +126,25 @@ case "${MODE_CHOICE}" in
   2)  # layers sweep
     SWEEP="layers"
     pick_k
-    echo -e "\n${B}Layers:${R}  comma list (e.g. '0,8,16,24') or 'all' (0–$(( N_LAYERS - 1 )))"
-    ask LAYERS "Layers" "all"
+    MID=$(( N_LAYERS / 2 ))
+    EVERY4="$(seq -s, 0 4 $(( N_LAYERS - 1 )))"        # 0,4,8,...
+    EVERY4_MID="$(seq -s, ${MID} 4 $(( N_LAYERS - 1 )))"  # mid,mid+4,... (second half)
+    MID2="$(seq -s, ${MID} 2 $(( N_LAYERS - 1 )))"     # mid,mid+2,... (second half)
+    echo -e "\n${B}Layers (each SAE adds ~model-sized memory):${R}"
+    echo "  1) every 4th after mid  (${EVERY4_MID})"
+    echo "  2) every 4th            (${EVERY4})"
+    echo "  3) every 2nd after mid  (${MID2})"
+    echo "  4) all                  (0–$(( N_LAYERS - 1 )))"
+    echo "  5) custom comma list"
+    ask LSEL "Layers" "1"
+    case "${LSEL}" in
+      1) LAYERS="${EVERY4_MID}" ;;
+      2) LAYERS="${EVERY4}" ;;
+      3) LAYERS="${MID2}" ;;
+      4) LAYERS="all" ;;
+      5) ask LAYERS "Comma list" "0,8,16,24" ;;
+      *) echo "Invalid."; exit 1 ;;
+    esac
     ;;
   3)  # k sweep
     SWEEP="k"
@@ -167,8 +196,11 @@ printf "  %-18s %s\n" "dtype:"     "${DTYPE}"
 printf "  %-18s %s\n" "W&B:"       "${WANDB_PROJECT}"
 hr
 if [[ "${SWEEP}" != "none" ]]; then
-  echo -e "${Y}Note:${R} sweep modes train every SAE in ONE process; ensure all SAEs"
-  echo -e "      fit in cuda:${GPU} memory (model + N×SAE params/optimizer states)."
+  case "${ACT_STORE_DEVICE,,}" in gpu|cuda|"") ACT_LOC="GPU" ;; *) ACT_LOC="${ACT_STORE_DEVICE}" ;; esac
+  echo -e "${Y}Sweep memory:${R} act-store=${ACT_LOC}  buffer=${NB_BUF}  store-batch=${STORE_BS}"
+  echo -e "             alloc_conf=${PYTORCH_HIP_ALLOC_CONF}"
+  echo -e "             (override via NB_BUF / STORE_BS env vars; if still OOM, set"
+  echo -e "              ACT_STORE_DEVICE=cpu, drop --d-sae expansion, or sweep fewer layers)"
 fi
 
 ask CONFIRM "Launch? (y/n)" "y"
@@ -252,6 +284,17 @@ COMMON=(
 )
 [[ -n "${WANDB_FLAG}" ]] && COMMON+=("${WANDB_FLAG}")
 
+# Extra memory-saving flags applied to sweep modes only (single runs are light).
+# Activations stay on the GPU by default; only offload to CPU when explicitly asked.
+SWEEP_MEM=(
+  --n-batches-in-buffer "${NB_BUF}"
+  --store-batch-size    "${STORE_BS}"
+)
+case "${ACT_STORE_DEVICE,,}" in
+  gpu|cuda|"") : ;;                                   # keep on the training GPU
+  *) SWEEP_MEM+=( --act-store-device "${ACT_STORE_DEVICE}" ) ;;
+esac
+
 # ── Launch ────────────────────────────────────────────────────────────────────
 case "${SWEEP}" in
   none)
@@ -264,14 +307,14 @@ case "${SWEEP}" in
   layers)
     LOG="${RUN_DIR}/logs/sweep_layers.txt"
     echo -e "\n${G}Layer sweep [${LAYERS}] (k=${K}) on cuda:${GPU}  (log: ${LOG})${R}\n"
-    "${PYTHON}" "${SCRIPT}" "${COMMON[@]}" \
+    "${PYTHON}" "${SCRIPT}" "${COMMON[@]}" "${SWEEP_MEM[@]}" \
       --sweep layers --layers "${LAYERS}" --n-layers "${N_LAYERS}" --k "${K}" 2>&1 | tee "${LOG}"
     ;;
   k)
     HOOK="blocks.${LAYER}.hook_resid_post"
     LOG="${RUN_DIR}/logs/sweep_k_L${LAYER}.txt"
     echo -e "\n${G}k sweep [${K_VALUES}] @ ${HOOK} on cuda:${GPU}  (log: ${LOG})${R}\n"
-    "${PYTHON}" "${SCRIPT}" "${COMMON[@]}" \
+    "${PYTHON}" "${SCRIPT}" "${COMMON[@]}" "${SWEEP_MEM[@]}" \
       --sweep k --hook-name "${HOOK}" --k-values "${K_VALUES}" 2>&1 | tee "${LOG}"
     ;;
 esac
