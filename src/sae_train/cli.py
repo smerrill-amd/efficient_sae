@@ -133,11 +133,12 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
 
     # ---- Profiling ----------------------------------------------------------
     pf = p.add_argument_group("Profiling (single + sweep modes)")
-    pf.add_argument("--profile-timing", action="store_true", default=False,
-                    help="Measure the wall-clock split between the LLM forward "
-                         "(activation generation) and SAE training (fwd+bwd+optim). "
-                         "Works in both single-SAE and sweep modes. Adds CUDA syncs, "
-                         "so throughput drops slightly while profiling.")
+    pf.add_argument("--no-profile-timing", dest="profile_timing", action="store_false", default=True,
+                    help="Disable the wall-clock timing profiler. Profiling (the LLM "
+                         "forward vs SAE training split, written to stdout + "
+                         "timing_profile.json + W&B profile/* plots) is ON by default; "
+                         "this skips it and its small CUDA-sync overhead. Works in both "
+                         "single-SAE and sweep modes.")
     pf.add_argument("--profile-steps", type=int, default=0,
                     help="With --profile-timing, stop after this many training batches "
                          "and print the breakdown (0 = profile the whole run).")

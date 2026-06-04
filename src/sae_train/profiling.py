@@ -14,7 +14,9 @@ This is precision-agnostic: it times whatever the SAE forward/backward does,
 so it works unchanged for fp16/fp8/fp4.
 """
 
+import json
 import time
+from pathlib import Path
 
 import torch
 
@@ -26,15 +28,19 @@ class ProfilingComplete(Exception):
 
 
 class TimingProfiler:
-    def __init__(self, device: str, max_steps: int = 0, report_every: int = 200):
+    def __init__(self, device: str, max_steps: int = 0, report_every: int = 200,
+                 json_path: "str | Path | None" = None, log_wandb: bool = False):
         self.use_cuda = torch.cuda.is_available() and "cuda" in str(device)
         self.max_steps = max_steps
         self.report_every = report_every
+        self.json_path = Path(json_path) if json_path else None
+        self.log_wandb = log_wandb
         self.data_time = 0.0   # next(data_provider): LLM fwd + buffer refill/shuffle
         self.sae_time = 0.0    # SAETrainer.step summed over all SAEs
         self.n_batches = 0     # batches pulled (incl. norm-estimate warmup)
         self.n_sae_steps = 0   # per-SAE step() calls
         self._t_install = None
+        self._wandb_defined = False
 
     def _sync(self) -> None:
         if self.use_cuda:
@@ -110,9 +116,8 @@ class TimingProfiler:
             yield val
             prof._record_data(dt)
 
-    def report(self, partial: bool) -> None:
-        if self._t_install is None:
-            return
+    def _stats(self, partial: bool) -> dict:
+        """Snapshot the current breakdown as a flat, serializable dict."""
         wall = time.perf_counter() - self._t_install
         tracked = self.data_time + self.sae_time
         other = max(wall - tracked, 0.0)
@@ -120,23 +125,91 @@ class TimingProfiler:
         def pct(x: float, denom: float) -> float:
             return 100.0 * x / denom if denom > 0 else 0.0
 
-        n_saes = max(self.n_sae_steps // max(self.n_batches, 1), 1)
+        nb = max(self.n_batches, 1)
+        return {
+            "complete": not partial,
+            "n_batches": self.n_batches,
+            "n_sae_steps": self.n_sae_steps,
+            "approx_n_saes": max(self.n_sae_steps // nb, 1),
+            "forward_seconds": self.data_time,
+            "sae_seconds": self.sae_time,
+            "other_seconds": other,
+            "wall_seconds": wall,
+            "forward_pct_compute": pct(self.data_time, tracked),
+            "sae_pct_compute": pct(self.sae_time, tracked),
+            "forward_pct_wall": pct(self.data_time, wall),
+            "sae_pct_wall": pct(self.sae_time, wall),
+            "other_pct_wall": pct(other, wall),
+            "forward_ms_per_batch": 1000 * self.data_time / nb,
+            "sae_ms_per_batch": 1000 * self.sae_time / nb,
+        }
+
+    def report(self, partial: bool) -> None:
+        if self._t_install is None:
+            return
+        s = self._stats(partial)
         tag = "running" if partial else "FINAL"
         print(
             f"\n{'='*64}\n"
-            f"  TIMING PROFILE ({tag}) — {self.n_batches} batches, "
-            f"{self.n_sae_steps} per-SAE steps (~{n_saes} SAEs)\n"
+            f"  TIMING PROFILE ({tag}) — {s['n_batches']} batches, "
+            f"{s['n_sae_steps']} per-SAE steps (~{s['approx_n_saes']} SAEs)\n"
             f"{'-'*64}"
         )
-        print(f"  LLM forward / act-gen : {fmt_duration(self.data_time):>10}  "
-              f"({pct(self.data_time, tracked):5.1f}% compute | {pct(self.data_time, wall):5.1f}% wall)")
-        print(f"  SAE train (fwd+bwd)   : {fmt_duration(self.sae_time):>10}  "
-              f"({pct(self.sae_time, tracked):5.1f}% compute | {pct(self.sae_time, wall):5.1f}% wall)")
-        print(f"  other (norm/eval/log) : {fmt_duration(other):>10}  "
-              f"({'':>5}          {pct(other, wall):5.1f}% wall)")
-        print(f"  wall                  : {fmt_duration(wall):>10}")
+        print(f"  LLM forward / act-gen : {fmt_duration(s['forward_seconds']):>10}  "
+              f"({s['forward_pct_compute']:5.1f}% compute | {s['forward_pct_wall']:5.1f}% wall)")
+        print(f"  SAE train (fwd+bwd)   : {fmt_duration(s['sae_seconds']):>10}  "
+              f"({s['sae_pct_compute']:5.1f}% compute | {s['sae_pct_wall']:5.1f}% wall)")
+        print(f"  other (norm/eval/log) : {fmt_duration(s['other_seconds']):>10}  "
+              f"({'':>5}          {s['other_pct_wall']:5.1f}% wall)")
+        print(f"  wall                  : {fmt_duration(s['wall_seconds']):>10}")
         if self.n_batches:
-            print(f"  per batch: forward {1000 * self.data_time / self.n_batches:6.1f} ms"
-                  f"  |  sae {1000 * self.sae_time / self.n_batches:6.1f} ms"
-                  f"  (sae = sum over ~{n_saes} SAEs)")
+            print(f"  per batch: forward {s['forward_ms_per_batch']:6.1f} ms"
+                  f"  |  sae {s['sae_ms_per_batch']:6.1f} ms"
+                  f"  (sae = sum over ~{s['approx_n_saes']} SAEs)")
         print(f"{'='*64}")
+
+        self._write_json(s)
+        self._maybe_log_wandb(s)
+
+    def _write_json(self, stats: dict) -> None:
+        """Persist the breakdown to JSON (overwritten on every report, so an
+        interrupted run still leaves the latest snapshot on disk)."""
+        if self.json_path is None:
+            return
+        try:
+            self.json_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.json_path, "w") as f:
+                json.dump(stats, f, indent=2)
+        except OSError as e:
+            print(f"  [profiler] could not write {self.json_path}: {e}")
+
+    def _maybe_log_wandb(self, stats: dict) -> None:
+        """Log the running breakdown to W&B against a dedicated `profile/n_batches`
+        axis. No-op once the run has finished (e.g. the FINAL report fires after
+        the runner calls wandb.finish()), so final totals live only in JSON/stdout.
+        commit=False attaches to the current step without advancing W&B's global
+        step, so it never disturbs SAELens' explicit step-based logging."""
+        if not self.log_wandb:
+            return
+        try:
+            import wandb
+        except ImportError:
+            return
+        if wandb.run is None:
+            return
+        if not self._wandb_defined:
+            wandb.define_metric("profile/n_batches")
+            wandb.define_metric("profile/*", step_metric="profile/n_batches")
+            self._wandb_defined = True
+        wandb.log(
+            {
+                "profile/n_batches": stats["n_batches"],
+                "profile/forward_ms_per_batch": stats["forward_ms_per_batch"],
+                "profile/sae_ms_per_batch": stats["sae_ms_per_batch"],
+                "profile/forward_pct_compute": stats["forward_pct_compute"],
+                "profile/sae_pct_compute": stats["sae_pct_compute"],
+                "profile/cumulative_forward_seconds": stats["forward_seconds"],
+                "profile/cumulative_sae_seconds": stats["sae_seconds"],
+            },
+            commit=False,
+        )

@@ -148,6 +148,8 @@ def run_single(args, policy: PrecisionPolicy) -> None:
             device=args.device,
             max_steps=args.profile_steps,
             report_every=args.profile_report_every,
+            json_path=Path(checkpoint_path) / "timing_profile.json",
+            log_wandb=not args.no_wandb,
         )
         profiler.install()
         print("Timing profiler ON: splitting wall-clock between LLM forward and "
@@ -331,6 +333,8 @@ def run_multi(args, policy: PrecisionPolicy) -> None:
             device=args.device,
             max_steps=args.profile_steps,
             report_every=args.profile_report_every,
+            json_path=Path(output_path) / "logs" / "timing_profile.json",
+            log_wandb=not args.no_wandb,
         )
         profiler.install()
         print("Timing profiler ON: splitting wall-clock between LLM forward and "
