@@ -47,6 +47,7 @@ to launch gemma on GPU 0 and pythia on GPU 1 simultaneously.
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 from sae_lens import (
@@ -55,6 +56,13 @@ from sae_lens import (
     MultiSAETrainingRunner,
     MultiSAETrainingRunnerConfig,
 )
+
+# Make the repo-root `architectures` package importable (for the optional --fp8 path).
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from architectures import BatchTopKFP8TrainingSAEConfig  # noqa: E402  (registers fp8 arch)
+from architectures.fp8_formats import get_format  # noqa: E402
 
 # --- SAEBench fixed recipe (identical across both models / every SAE) ---------
 BATCH_TOKENS = 2048
@@ -98,13 +106,20 @@ MODEL_SPECS = {
 
 
 def build_saes(d_in: int, widths: list[int], ks: list[int], device: str,
-               sae_dtype: str) -> dict[str, BatchTopKTrainingSAEConfig]:
-    """One BatchTopK config per (width, k), all sharing the same hook."""
+               sae_dtype: str, fp8: bool = False, fp8_format: str = "e4m3",
+               fp8_backend: str = "hardware", fp8_quantize_grads: bool = False
+               ) -> dict[str, BatchTopKTrainingSAEConfig]:
+    """One BatchTopK config per (width, k), all sharing the same hook.
+
+    With ``fp8=True`` the SAE is the ``batchtopk_fp8`` variant whose encoder/decoder
+    matmuls run in 8-bit float — every *other* hyperparameter is byte-for-byte identical
+    to the FP16 recipe, so the only change is the GEMM precision.
+    """
     saes: dict[str, BatchTopKTrainingSAEConfig] = {}
     for w in widths:
         for k in ks:
             name = f"w{w}_k{k}"
-            saes[name] = BatchTopKTrainingSAEConfig(
+            common = dict(
                 d_in=d_in,
                 d_sae=w,
                 k=k,
@@ -117,6 +132,15 @@ def build_saes(d_in: int, widths: list[int], ks: list[int], device: str,
                 dtype=sae_dtype,
                 device=device,
             )
+            if fp8:
+                saes[name] = BatchTopKFP8TrainingSAEConfig(
+                    fp8_format=fp8_format,
+                    fp8_backend=fp8_backend,
+                    fp8_quantize_grads=fp8_quantize_grads,
+                    **common,
+                )
+            else:
+                saes[name] = BatchTopKTrainingSAEConfig(**common)
     return saes
 
 
@@ -140,6 +164,20 @@ def parse_args() -> argparse.Namespace:
                    help="SAE weight dtype. float32 = robust recipe (autocast matmuls "
                         "in bf16 + fp32 master + GradScaler). Set bfloat16 to ~halve "
                         "SAE memory if the 18-SAE grid OOMs (notably gemma 65k x6).")
+    g = p.add_argument_group("FP8 training (optional)")
+    g.add_argument("--fp8", action="store_true", default=False,
+                   help="Train the batchtopk_fp8 SAE: encoder/decoder matmuls in 8-bit "
+                        "float, every other hyperparameter identical to the FP16 recipe. "
+                        "Forces autocast OFF and --dtype == --sae-dtype (fp8 manages "
+                        "precision in the GEMM; default both float32 = fp32 master).")
+    g.add_argument("--fp8-format", default="e4m3",
+                   help="fp8 layout for the matmuls (e4m3/e5m2 hardware-native). Default e4m3.")
+    g.add_argument("--fp8-backend", default="hardware",
+                   choices=["hardware", "emulated", "auto"],
+                   help="hardware: real torch._scaled_mm fp8 GEMM (E4M3/E5M2). "
+                        "emulated: software fake-quant (any format). Default hardware.")
+    g.add_argument("--fp8-quantize-grads", action="store_true", default=False,
+                   help="Also quantize gradients to fp8 (approximate fully-fp8 training).")
     p.add_argument("--widths", default=None,
                    help="Comma list of widths to train (default: 4096,16384,65536). "
                         "Drop the 65k width here if you OOM.")
@@ -168,11 +206,27 @@ def main() -> None:
     widths = [int(x) for x in args.widths.split(",")] if args.widths else [2 ** p for p in WIDTH_POWS]
     ks = [int(x) for x in args.ks.split(",")] if args.ks else list(K_VALUES)
 
+    if args.fp8:
+        # fp8 manages precision explicitly inside the GEMM (no SAELens autocast), so the
+        # activation and master dtypes must match (else the bf16-acts/fp32-weights MSE
+        # crashes). Coerce --dtype to the master --sae-dtype (default float32 = fp32
+        # master, same as the FP16 baseline). Pass --sae-dtype bfloat16 for a bf16 master.
+        get_format(args.fp8_format)  # validate the format string early
+        if args.dtype != args.sae_dtype:
+            print(f"[fp8] coercing --dtype {args.dtype} -> {args.sae_dtype} "
+                  "(fp8 disables autocast; activation/master dtypes must match).")
+            args.dtype = args.sae_dtype
+
     hook_name = f"blocks.{spec['layer']}.hook_resid_post"
-    saes = build_saes(spec["d_in"], widths, ks, device, args.sae_dtype)
+    saes = build_saes(spec["d_in"], widths, ks, device, args.sae_dtype,
+                      fp8=args.fp8, fp8_format=args.fp8_format,
+                      fp8_backend=args.fp8_backend,
+                      fp8_quantize_grads=args.fp8_quantize_grads)
     hook_names = {name: hook_name for name in saes}
 
-    run_dir = args.output_dir / f"saebench_{args.model}"
+    # Separate output tree for fp8 so it never clobbers the FP16 baseline results.
+    run_suffix = "_fp8" if args.fp8 else ""
+    run_dir = args.output_dir / f"saebench_{args.model}{run_suffix}"
     run_dir.mkdir(parents=True, exist_ok=True)
     training_steps = args.training_tokens // BATCH_TOKENS
 
@@ -187,6 +241,9 @@ def main() -> None:
     print(f"  aux_coeff   {AUX_LOSS_COEFFICIENT}  topk_threshold_lr={TOPK_THRESHOLD_LR}")
     print(f"  dataset     {args.dataset}")
     print(f"  batch/ctx   {BATCH_TOKENS} tokens / {CONTEXT_SIZE} ctx   seed={SEED}")
+    prec = (f"FP8 ({args.fp8_format}, backend={args.fp8_backend}, "
+            f"quant_grads={args.fp8_quantize_grads})" if args.fp8 else "FP16/bf16")
+    print(f"  precision   {prec}")
     print(f"  device      {device}   acts={args.dtype}  sae={args.sae_dtype}")
     print(f"  output      {run_dir}")
     print("=" * 70)
@@ -194,22 +251,26 @@ def main() -> None:
     if args.dry_run:
         print("\n[dry-run] planned SAEs:")
         for name, cfg in saes.items():
+            fp8_info = (f" fp8={cfg.fp8_format}/{cfg.fp8_backend}"
+                        if isinstance(cfg, BatchTopKFP8TrainingSAEConfig) else "")
             print(f"  {name:14s} d_in={cfg.d_in} d_sae={cfg.d_sae} k={cfg.k} "
                   f"aux={cfg.aux_loss_coefficient} thr_lr={cfg.topk_threshold_lr} "
-                  f"norm={cfg.normalize_activations} b_dec={cfg.apply_b_dec_to_input}")
+                  f"norm={cfg.normalize_activations} b_dec={cfg.apply_b_dec_to_input}"
+                  f"{fp8_info} arch={cfg.architecture()}")
         print("\n[dry-run] no training performed.")
         return
 
-    wandb_project = args.wandb_project or f"saebench-repro-{args.model}"
+    wandb_project = args.wandb_project or f"saebench-repro-{args.model}{run_suffix}"
     logger_cfg = LoggingConfig(
         log_to_wandb=not args.no_wandb,
         wandb_project=wandb_project,
-        run_name=f"saebench_{args.model}_batchtopk_allwidths_allk",
+        run_name=f"saebench_{args.model}{run_suffix}_batchtopk_allwidths_allk",
     )
 
-    # float32 SAE weights keep the AMP GradScaler path (autocast matmuls in bf16);
+    # FP8 manages precision explicitly inside the GEMM -> no SAELens autocast/GradScaler.
+    # FP16: float32 SAE weights keep the AMP GradScaler path (autocast matmuls in bf16);
     # native bf16 weights disable it (no bf16 kernel for unscale).
-    sae_autocast = args.sae_dtype != "bfloat16"
+    sae_autocast = (not args.fp8) and (args.sae_dtype != "bfloat16")
 
     cfg = MultiSAETrainingRunnerConfig(
         saes=saes,

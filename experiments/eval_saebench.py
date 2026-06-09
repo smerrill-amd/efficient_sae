@@ -62,6 +62,7 @@ import gc
 import glob
 import os
 import re
+import sys
 from pathlib import Path
 
 # Authoritative trainer<->k mapping for the 65k BatchTopK suite (by achieved L0).
@@ -175,6 +176,24 @@ def discover_checkpoints(run_dir: Path, member: str, which: str) -> list[tuple[i
     return sorted((s, ckpt_dirs[s]) for s in wanted)
 
 
+def _ensure_repo_archs_registered() -> None:
+    """Register repo-local training architectures (e.g. ``batchtopk_fp8``).
+
+    Intermediate checkpoints of an ``--fp8`` run are saved in the raw
+    ``batchtopk_fp8`` training architecture, which only exists once the repo's
+    ``architectures`` package is imported. (The final exported SAE is already a
+    standard ``jumprelu`` and loads without this.) Idempotent + best-effort.
+    """
+    repo_root = Path(__file__).resolve().parents[1]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    try:
+        import architectures  # noqa: F401  (registers batchtopk_fp8 on import)
+    except Exception as e:  # noqa: BLE001
+        print(f"  [warn] could not import repo `architectures` ({e}); "
+              f"non-standard training archs (e.g. batchtopk_fp8) may fail to load.")
+
+
 def load_inference_sae(ckpt_dir: Path, cache_dir: Path, device: str, dtype: str):
     """Load an SAE ready for inference.
 
@@ -189,8 +208,9 @@ def load_inference_sae(ckpt_dir: Path, cache_dir: Path, device: str, dtype: str)
     try:
         return SAE.load_from_disk(str(ckpt_dir), device=device, dtype=dtype)
     except KeyError:
-        pass  # training-only architecture (batchtopk) -> convert below
+        pass  # training-only architecture (batchtopk / batchtopk_fp8) -> convert below
 
+    _ensure_repo_archs_registered()  # make batchtopk_fp8 loadable before converting
     cache_dir.mkdir(parents=True, exist_ok=True)
     if not (cache_dir / "cfg.json").exists():
         training_sae = TrainingSAE.load_from_disk(str(ckpt_dir), device=device, dtype=dtype)
