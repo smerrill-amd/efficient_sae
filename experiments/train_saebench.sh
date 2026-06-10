@@ -43,6 +43,10 @@ DTYPE="${DTYPE:-bfloat16}"
 SAE_DTYPE="${SAE_DTYPE:-float32}"
 WIDTHS="${WIDTHS:-}"            # empty -> script default 4096,16384,65536
 KS="${KS:-}"                   # empty -> script default 20,40,80,160,320,640
+LR="${LR:-}"                   # empty -> script default 3e-4
+BATCH_SIZE="${BATCH_SIZE:-}"   # empty -> script default 2048 tokens (architectural in BatchTopK!)
+RUN_TAG="${RUN_TAG:-}"         # empty -> plain saebench_<model>[_fp8] dir
+FP8="${FP8:-0}"                # 1 -> train the batchtopk_fp8 variant
 N_CHECKPOINTS="${N_CHECKPOINTS:-0}"
 NO_WANDB_FLAG=""; [[ "${NO_WANDB:-0}" == "1" ]] && NO_WANDB_FLAG="--no-wandb"
 DRY_FLAG=""; [[ "${DRY_RUN:-0}" == "1" ]] && DRY_FLAG="--dry-run"
@@ -67,8 +71,12 @@ run_model() {  # $1=model key, $2=gpu ; backgrounds the run and sets LAST_PID.
     --sae-dtype     "${SAE_DTYPE}"
     --n-checkpoints "${N_CHECKPOINTS}"
   )
-  [[ -n "${WIDTHS}" ]] && args+=( --widths "${WIDTHS}" )
-  [[ -n "${KS}" ]]     && args+=( --ks "${KS}" )
+  [[ -n "${WIDTHS}" ]]     && args+=( --widths "${WIDTHS}" )
+  [[ -n "${KS}" ]]         && args+=( --ks "${KS}" )
+  [[ -n "${LR}" ]]         && args+=( --lr "${LR}" )
+  [[ -n "${BATCH_SIZE}" ]] && args+=( --batch-size "${BATCH_SIZE}" )
+  [[ -n "${RUN_TAG}" ]]    && args+=( --run-tag "${RUN_TAG}" )
+  [[ "${FP8}" == "1" ]]    && args+=( --fp8 )
   [[ -n "${NO_WANDB_FLAG}" ]] && args+=( "${NO_WANDB_FLAG}" )
   [[ -n "${DRY_FLAG}" ]]      && args+=( "${DRY_FLAG}" )
 
@@ -81,6 +89,7 @@ echo "============================================================"
 echo "  SAEBench BatchTopK replication (parallel, one model per GPU)"
 echo "  models=[${MODELS}]  gemma->cuda:${GEMMA_GPU}  pythia->cuda:${PYTHIA_GPU}"
 echo "  widths=[${WIDTHS:-default 4096,16384,65536}]  ks=[${KS:-default 20,40,80,160,320,640}]"
+echo "  lr=${LR:-default 3e-4}  batch=${BATCH_SIZE:-default 2048}  fp8=${FP8}  tag=${RUN_TAG:-<none>}"
 echo "  acts=${DTYPE}  sae=${SAE_DTYPE}  ckpts=${N_CHECKPOINTS}  output=${OUTPUT_DIR}"
 echo "============================================================"
 

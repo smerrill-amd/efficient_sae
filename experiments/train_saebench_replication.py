@@ -61,7 +61,10 @@ from sae_lens import (
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
-from architectures import BatchTopKFP8TrainingSAEConfig  # noqa: E402  (registers fp8 arch)
+from architectures import (  # noqa: E402  (importing registers the fp8 + grouped archs)
+    BatchTopKFP8TrainingSAEConfig,
+    GroupedBatchTopKTrainingSAEConfig,
+)
 from architectures.fp8_formats import get_format  # noqa: E402
 
 # --- SAEBench fixed recipe (identical across both models / every SAE) ---------
@@ -73,6 +76,10 @@ LR = 3e-4
 LR_WARMUP_STEPS = 1_000
 DECAY_START = 195_312                 # last 20% -> decay over the remaining steps
 LR_DECAY_STEPS = TOTAL_STEPS - DECAY_START  # 48,828
+# Express the schedule in *tokens* so it stays consistent when --batch-size changes
+# (otherwise a bigger batch -> fewer steps -> 1000-step warmup becomes a huge fraction).
+WARMUP_TOKENS = LR_WARMUP_STEPS * BATCH_TOKENS   # 2,048,000 tokens of LR warmup
+DECAY_FRACTION = LR_DECAY_STEPS / TOTAL_STEPS    # ~0.20 (decay over the last 20%)
 AUX_LOSS_COEFFICIENT = 0.03125        # auxk_alpha = 1/32
 THRESHOLD_BETA = 0.999                # BatchTopK EMA threshold beta
 TOPK_THRESHOLD_LR = round(1.0 - THRESHOLD_BETA, 6)  # 0.001
@@ -107,13 +114,20 @@ MODEL_SPECS = {
 
 def build_saes(d_in: int, widths: list[int], ks: list[int], device: str,
                sae_dtype: str, fp8: bool = False, fp8_format: str = "e4m3",
-               fp8_backend: str = "hardware", fp8_quantize_grads: bool = False
+               fp8_backend: str = "hardware", fp8_quantize_grads: bool = False,
+               topk_group_size: int = 0
                ) -> dict[str, BatchTopKTrainingSAEConfig]:
     """One BatchTopK config per (width, k), all sharing the same hook.
 
     With ``fp8=True`` the SAE is the ``batchtopk_fp8`` variant whose encoder/decoder
     matmuls run in 8-bit float — every *other* hyperparameter is byte-for-byte identical
     to the FP16 recipe, so the only change is the GEMM precision.
+
+    With ``topk_group_size > 0`` the BatchTopK top-k is taken within fixed-size
+    ("ghost-batch") groups of that many samples instead of the whole batch, so the
+    selection pool stays constant as the optimization batch grows (decouples the
+    learning-dynamics effect of batch size from its architectural effect). This uses
+    the ``batchtopk_grouped`` arch (or the fp8 arch's group option when ``fp8=True``).
     """
     saes: dict[str, BatchTopKTrainingSAEConfig] = {}
     for w in widths:
@@ -137,7 +151,12 @@ def build_saes(d_in: int, widths: list[int], ks: list[int], device: str,
                     fp8_format=fp8_format,
                     fp8_backend=fp8_backend,
                     fp8_quantize_grads=fp8_quantize_grads,
+                    topk_group_size=topk_group_size,
                     **common,
+                )
+            elif topk_group_size and topk_group_size > 0:
+                saes[name] = GroupedBatchTopKTrainingSAEConfig(
+                    topk_group_size=topk_group_size, **common
                 )
             else:
                 saes[name] = BatchTopKTrainingSAEConfig(**common)
@@ -183,6 +202,26 @@ def parse_args() -> argparse.Namespace:
                         "Drop the 65k width here if you OOM.")
     p.add_argument("--ks", default=None,
                    help="Comma list of k values (default: 20,40,80,160,320,640).")
+    p.add_argument("--lr", type=float, default=LR,
+                   help=f"Adam learning rate (default: SAEBench {LR}). Sweep alongside "
+                        "--batch-size for the lr/batch study.")
+    p.add_argument("--batch-size", type=int, default=BATCH_TOKENS, dest="batch_size",
+                   help=f"Training batch size in TOKENS (default: {BATCH_TOKENS}). NOTE: "
+                        "in BatchTopK this is architectural, not just optimization — the "
+                        "top-k is taken over the (batch x d_sae) pool, so changing it "
+                        "changes which features survive and the frozen JumpReLU threshold. "
+                        "LR warmup/decay are re-derived in tokens so the recipe stays "
+                        "token-consistent across batch sizes.")
+    p.add_argument("--topk-group-size", type=int, default=0, dest="topk_group_size",
+                   help="If >0, take BatchTopK within fixed-size ('ghost-batch') groups "
+                        "of this many samples instead of the whole batch, so the top-k "
+                        "selection pool stays constant as --batch-size grows (decouples "
+                        "batch's learning-dynamics effect from its architectural effect). "
+                        "0 = standard whole-batch BatchTopK. Must divide --batch-size.")
+    p.add_argument("--run-tag", default="",
+                   help="Optional suffix appended to the run dir + W&B run name "
+                        "(e.g. 'lr3e-4_bs4096'), so sweep points don't clobber each "
+                        "other. Empty = the plain saebench_<model>[_fp8] dir.")
     p.add_argument("--training-tokens", type=int, default=TRAINING_TOKENS,
                    help="Override the token budget (default: SAEBench's 500M).")
     p.add_argument("--n-checkpoints", type=int, default=0,
@@ -221,14 +260,44 @@ def main() -> None:
     saes = build_saes(spec["d_in"], widths, ks, device, args.sae_dtype,
                       fp8=args.fp8, fp8_format=args.fp8_format,
                       fp8_backend=args.fp8_backend,
-                      fp8_quantize_grads=args.fp8_quantize_grads)
+                      fp8_quantize_grads=args.fp8_quantize_grads,
+                      topk_group_size=args.topk_group_size)
     hook_names = {name: hook_name for name in saes}
 
     # Separate output tree for fp8 so it never clobbers the FP16 baseline results.
-    run_suffix = "_fp8" if args.fp8 else ""
+    # An optional --run-tag further separates sweep points (lr/batch grid). The fp8
+    # suffix alone keys the W&B *project*; the tag only distinguishes runs within it.
+    fp8_suffix = "_fp8" if args.fp8 else ""
+    run_suffix = fp8_suffix + (f"_{args.run_tag}" if args.run_tag else "")
     run_dir = args.output_dir / f"saebench_{args.model}{run_suffix}"
     run_dir.mkdir(parents=True, exist_ok=True)
-    training_steps = args.training_tokens // BATCH_TOKENS
+
+    # Batch size and LR are sweepable; re-derive the (token-defined) schedule for the
+    # chosen batch so warmup/decay cover the same token budget regardless of batch size.
+    batch_tokens = args.batch_size
+    lr = args.lr
+    training_steps = args.training_tokens // batch_tokens
+    warmup_steps = max(1, round(WARMUP_TOKENS / batch_tokens))
+    decay_steps = round(DECAY_FRACTION * training_steps)
+
+    if args.topk_group_size and batch_tokens % args.topk_group_size != 0:
+        raise SystemExit(
+            f"--topk-group-size {args.topk_group_size} must divide --batch-size "
+            f"{batch_tokens} (got remainder {batch_tokens % args.topk_group_size})."
+        )
+
+    # Cap the eval batch so BatchTopK's eval-time top-k never overflows INT_MAX.
+    # `run_evals` flattens the SAE acts to (eval_prompts * ctx * d_sae) and calls
+    # torch.topk along that single dim, which hard-fails once it exceeds INT_MAX
+    # (2^31-1). At the 65,536 width the default eval batch (store_batch_size_prompts,
+    # =32 for pythia) gives 32*1024*65536 = 2^31 elements — one over the limit — so
+    # the run dies at the first eval. Pick the largest eval batch that stays under
+    # the limit for the widest SAE (and never exceeds the store's own batch).
+    max_d_sae = max(widths)
+    int_max = 2**31 - 1
+    eval_batch_size_prompts = max(
+        1, min(spec["store_batch_size_prompts"], int_max // (CONTEXT_SIZE * max_d_sae))
+    )
 
     print("=" * 70)
     print(f"  SAEBench BatchTopK replication — {args.model} ({spec['model_name']})")
@@ -237,14 +306,15 @@ def main() -> None:
     print(f"  k values    {ks}")
     print(f"  -> {len(saes)} SAEs, shared model + one forward pass per batch")
     print(f"  tokens      {args.training_tokens:,}  ({training_steps:,} steps)")
-    print(f"  lr          {LR}  warmup={LR_WARMUP_STEPS}  decay_steps={LR_DECAY_STEPS} (last 20%)")
+    print(f"  lr          {lr}  warmup={warmup_steps}  decay_steps={decay_steps} (last {DECAY_FRACTION:.0%})")
     print(f"  aux_coeff   {AUX_LOSS_COEFFICIENT}  topk_threshold_lr={TOPK_THRESHOLD_LR}")
     print(f"  dataset     {args.dataset}")
-    print(f"  batch/ctx   {BATCH_TOKENS} tokens / {CONTEXT_SIZE} ctx   seed={SEED}")
+    print(f"  batch/ctx   {batch_tokens} tokens / {CONTEXT_SIZE} ctx   seed={SEED}")
     prec = (f"FP8 ({args.fp8_format}, backend={args.fp8_backend}, "
             f"quant_grads={args.fp8_quantize_grads})" if args.fp8 else "FP16/bf16")
     print(f"  precision   {prec}")
     print(f"  device      {device}   acts={args.dtype}  sae={args.sae_dtype}")
+    print(f"  eval batch  {eval_batch_size_prompts} prompts (BatchTopK INT_MAX-safe for d_sae<={max_d_sae})")
     print(f"  output      {run_dir}")
     print("=" * 70)
 
@@ -260,7 +330,7 @@ def main() -> None:
         print("\n[dry-run] no training performed.")
         return
 
-    wandb_project = args.wandb_project or f"saebench-repro-{args.model}{run_suffix}"
+    wandb_project = args.wandb_project or f"saebench-repro-{args.model}{fp8_suffix}"
     logger_cfg = LoggingConfig(
         log_to_wandb=not args.no_wandb,
         wandb_project=wandb_project,
@@ -279,16 +349,17 @@ def main() -> None:
         dataset_path=args.dataset,
         streaming=True,
         context_size=CONTEXT_SIZE,
-        lr=LR,
+        lr=lr,
         adam_beta1=0.9,
         adam_beta2=0.999,
         lr_scheduler_name="constant",      # constant + linear warmup + end decay
-        lr_warm_up_steps=LR_WARMUP_STEPS,
-        lr_decay_steps=LR_DECAY_STEPS,
-        train_batch_size_tokens=BATCH_TOKENS,
+        lr_warm_up_steps=warmup_steps,
+        lr_decay_steps=decay_steps,
+        train_batch_size_tokens=batch_tokens,
         n_batches_in_buffer=N_BATCHES_IN_BUFFER,
         training_tokens=args.training_tokens,
         store_batch_size_prompts=spec["store_batch_size_prompts"],
+        eval_batch_size_prompts=eval_batch_size_prompts,
         device=device,
         llm_device=device,
         seed=SEED,
