@@ -57,6 +57,8 @@ class BatchTopKFP8TrainingSAEConfig(BatchTopKTrainingSAEConfig):
     fp8_format: str = "e4m3"
     fp8_backend: str = "emulated"
     fp8_quantize_grads: bool = False
+    # Optional fixed-size ("ghost-batch") BatchTopK group; 0 = standard whole-batch.
+    topk_group_size: int = 0
 
     @override
     @classmethod
@@ -80,6 +82,15 @@ class BatchTopKFP8TrainingSAE(BatchTopKTrainingSAE):
         # Validate the format string early so misconfigs fail at construction.
         self._fmt = get_format(cfg.fp8_format)
         super().__init__(cfg, use_error_term)
+
+    @override
+    def get_activation_fn(self):
+        # Reuse the standard BatchTopK unless a fixed-size ("ghost-batch") group is set.
+        group = getattr(self.cfg, "topk_group_size", 0)
+        if group and group > 0:
+            from architectures.grouped_batchtopk import GroupedBatchTopK
+            return GroupedBatchTopK(self.cfg.k, group)
+        return super().get_activation_fn()
 
     def _fp8_matmul(self, x: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
         return fp8_linear(

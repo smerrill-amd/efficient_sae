@@ -19,9 +19,17 @@ from architectures.batchtopk_fp8_sae import (
     register,
 )
 from architectures.fp8_formats import FORMATS, Float8Format, get_format
+from architectures.grouped_batchtopk import (
+    GROUPED_BATCHTOPK_ARCH,
+    GroupedBatchTopK,
+    GroupedBatchTopKTrainingSAE,
+    GroupedBatchTopKTrainingSAEConfig,
+)
+from architectures.grouped_batchtopk import register as register_grouped
 
-# Register on import so `--arch batchtopk_fp8` / SyntheticSAERunner just work.
+# Register on import so `--arch batchtopk_fp8 / batchtopk_grouped` just work.
 register()
+register_grouped()
 
 __all__ = [
     "FP8_BATCHTOPK_ARCH",
@@ -31,4 +39,9 @@ __all__ = [
     "FORMATS",
     "Float8Format",
     "get_format",
+    "GROUPED_BATCHTOPK_ARCH",
+    "GroupedBatchTopK",
+    "GroupedBatchTopKTrainingSAE",
+    "GroupedBatchTopKTrainingSAEConfig",
+    "register_grouped",
 ]
