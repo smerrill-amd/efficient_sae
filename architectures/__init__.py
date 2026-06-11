@@ -26,10 +26,17 @@ from architectures.grouped_batchtopk import (
     GroupedBatchTopKTrainingSAEConfig,
 )
 from architectures.grouped_batchtopk import register as register_grouped
+from architectures.te_batchtopk_fp8_sae import (
+    TE_BATCHTOPK_ARCH,
+    BatchTopKTEFP8TrainingSAE,
+    BatchTopKTEFP8TrainingSAEConfig,
+)
+from architectures.te_batchtopk_fp8_sae import register as register_te_fp8
 
-# Register on import so `--arch batchtopk_fp8 / batchtopk_grouped` just work.
+# Register on import so `--arch batchtopk_fp8 / batchtopk_grouped / batchtopk_te_fp8` just work.
 register()
 register_grouped()
+register_te_fp8()
 
 __all__ = [
     "FP8_BATCHTOPK_ARCH",
@@ -44,4 +51,8 @@ __all__ = [
     "GroupedBatchTopKTrainingSAE",
     "GroupedBatchTopKTrainingSAEConfig",
     "register_grouped",
+    "TE_BATCHTOPK_ARCH",
+    "BatchTopKTEFP8TrainingSAE",
+    "BatchTopKTEFP8TrainingSAEConfig",
+    "register_te_fp8",
 ]

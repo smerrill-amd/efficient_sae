@@ -22,7 +22,16 @@ both float32 by default) and the SAELens autocast/GradScaler is OFF — the only
 reduction is the explicit fp8 cast in the matmul. (Mixing a bf16 activation dtype with
 fp32 weights without autocast would crash the MSE; keep them equal.)
 
-Currently FP8 supports --arch batchtopk only.
+Currently FP8 supports two architectures:
+  --arch batchtopk      The in-repo `batchtopk_fp8` SAE (`torch._scaled_mm` backend
+                        with per-tensor dynamic scaling). Configured via
+                        `--fp8-format`, `--fp8-backend`, `--fp8-quantize-grads`.
+  --arch batchtopk_te   The `batchtopk_te_fp8` SAE backed by transformer_engine
+                        (`te.Linear` with delayed scaling and the hybrid E4M3/E5M2
+                        recipe). Configured via `--fp8-recipe`, `--fp8-scaling`,
+                        `--delayed-amax-history-len`, `--delayed-amax-compute-algo`,
+                        `--fp8-margin`, `--no-fp8-aux-loss`. The non-TE flags above
+                        are ignored for this arch.
 """
 
 import sys
@@ -34,7 +43,10 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from architectures import BatchTopKFP8TrainingSAEConfig  # noqa: E402  (registers arch on import)
+from architectures import (  # noqa: E402  (registers archs on import)
+    BatchTopKFP8TrainingSAEConfig,
+    BatchTopKTEFP8TrainingSAEConfig,
+)
 from architectures.fp8_formats import FORMATS, get_format  # noqa: E402
 
 from sae_train.cli import build_parser  # noqa: E402
@@ -78,6 +90,33 @@ class FP8Policy(PrecisionPolicy):
                        help="Also quantize gradients to fp8 (approximate fully-fp8 "
                             "training). Default: fp8 forward, higher-precision backward.")
 
+        # --- TE-only (--arch batchtopk_te) ----------------------------------
+        t = parser.add_argument_group("Precision (fp8, TE-only — used with --arch batchtopk_te)")
+        t.add_argument("--fp8-recipe", default="hybrid",
+                       choices=["hybrid", "e4m3", "e5m2"],
+                       help="TE fp8 recipe. hybrid = E4M3 fwd / E5M2 bwd (production "
+                            "default); e4m3/e5m2 = symmetric. Used only by "
+                            "--arch batchtopk_te.")
+        t.add_argument("--fp8-scaling", default="delayed",
+                       choices=["delayed", "current"],
+                       help="delayed = rolling amax history (TE default, fuses amax "
+                            "into cast kernel); current = per-tensor dynamic (matches "
+                            "batchtopk_fp8 numerics, useful for ablation). TE-only.")
+        t.add_argument("--delayed-amax-history-len", type=int, default=16,
+                       help="[delayed only] amax history length. Longer = more "
+                            "stability against outliers. TE default is 1024.")
+        t.add_argument("--delayed-amax-compute-algo", default="max",
+                       choices=["max", "most_recent"],
+                       help="[delayed only] how the scale is derived from the amax "
+                            "history.")
+        t.add_argument("--fp8-margin", type=int, default=0,
+                       help="Extra headroom (powers of 2) added to each scale. "
+                            "Applies to both delayed and current scaling. TE-only.")
+        t.add_argument("--no-fp8-aux-loss", dest="fp8_aux_loss",
+                       action="store_false", default=True,
+                       help="Disable fp8 on the AuxK dead-neuron loss decoder GEMM "
+                            "(falls back to bf16/fp32). TE-only.")
+
     def build_sae_cfg(self, args, d_sae: int, k, training_steps: int):
         if args.dtype != args.sae_dtype:
             sys.exit(
@@ -85,17 +124,8 @@ class FP8Policy(PrecisionPolicy):
                 f"{args.sae_dtype}); autocast is disabled so mixed activation/weight "
                 "dtypes would crash the MSE loss."
             )
-        # Validate the format string up front for a clean error message.
-        get_format(args.fp8_format)
 
-        if args.arch != "batchtopk":
-            sys.exit(
-                f"ERROR: train_sae_FP8.py currently supports --arch batchtopk only "
-                f"(got {args.arch!r}). The fp8 BatchTopK SAE lives in "
-                "efficient_sae/architectures; add a sibling fp8 class for other archs."
-            )
-
-        return BatchTopKFP8TrainingSAEConfig(
+        base = dict(
             d_in=args.d_in,
             d_sae=d_sae,
             dtype=args.sae_dtype,
@@ -104,9 +134,32 @@ class FP8Policy(PrecisionPolicy):
             normalize_activations=args.normalize_activations,
             k=int(k),
             aux_loss_coefficient=args.aux_loss_coeff,
-            fp8_format=args.fp8_format,
-            fp8_backend=args.fp8_backend,
-            fp8_quantize_grads=args.fp8_quantize_grads,
+        )
+
+        if args.arch == "batchtopk":
+            # Validate the format string up front for a clean error message.
+            get_format(args.fp8_format)
+            return BatchTopKFP8TrainingSAEConfig(
+                **base,
+                fp8_format=args.fp8_format,
+                fp8_backend=args.fp8_backend,
+                fp8_quantize_grads=args.fp8_quantize_grads,
+            )
+
+        if args.arch == "batchtopk_te":
+            return BatchTopKTEFP8TrainingSAEConfig(
+                **base,
+                fp8_recipe=args.fp8_recipe,
+                fp8_scaling=args.fp8_scaling,
+                delayed_amax_history_len=args.delayed_amax_history_len,
+                delayed_amax_compute_algo=args.delayed_amax_compute_algo,
+                margin=args.fp8_margin,
+                fp8_aux_loss=args.fp8_aux_loss,
+            )
+
+        sys.exit(
+            f"ERROR: train_sae_FP8.py supports --arch batchtopk or batchtopk_te "
+            f"(got {args.arch!r}). Add a sibling fp8 class for other archs."
         )
 
     def resolve_autocast(self, args) -> bool:

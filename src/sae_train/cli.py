@@ -41,12 +41,15 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
     # ---- SAE architecture (dtype args added by the precision policy) --------
     arch = p.add_argument_group("SAE Architecture")
     arch.add_argument("--arch",
-                      choices=["relu", "standard", "topk", "batchtopk", "jumprelu"],
+                      choices=["relu", "standard", "topk", "batchtopk",
+                               "batchtopk_te", "jumprelu"],
                       default="topk",
                       help="SAE architecture: standard/relu (L1 penalty; 'relu' is a "
                            "legacy alias for 'standard'), topk (per-token hard sparsity), "
-                           "batchtopk (per-batch hard sparsity), or jumprelu (learned "
-                           "per-feature threshold with an L0 penalty)")
+                           "batchtopk (per-batch hard sparsity), batchtopk_te "
+                           "(BatchTopK with transformer_engine fp8 — only valid with "
+                           "train_sae_FP8.py), or jumprelu (learned per-feature "
+                           "threshold with an L0 penalty)")
     arch.add_argument("--d-sae", type=int, default=None,
                       help="SAE dictionary size. Overrides --dict-mult if set.")
     arch.add_argument("--dict-mult", type=int, default=8,
