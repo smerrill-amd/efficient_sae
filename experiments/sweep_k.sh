@@ -43,6 +43,7 @@ WIDTH="${WIDTH:-65536}"                       # 2^16 — has an authors release 
 KS="${KS:-50,100,250,500,1000,2500}"
 N_CHECKPOINTS="${N_CHECKPOINTS:-4}"           # 4 intermediate + final = 5 total checkpoints
 GPU="${GPU:-0}"
+SEED="${SEED:-0}"                             # RNG seed for every train run (reproducible by default)
 PHASE="${PHASE:-all}"
 EVALS="${EVALS:-core,sparse_probing}"
 CHECKPOINTS="${CHECKPOINTS:-all}"             # 'all' (5/ckpt, evolution) or 'final' (fast frontier)
@@ -70,7 +71,7 @@ suffix_for() {
 echo "============================================================"
 echo "  k-sweep  models=[${MODELS}]  precisions=[${PRECISIONS}]"
 echo "  width=${WIDTH}  ks=[${KS}]  checkpoints=${N_CHECKPOINTS} (+final)"
-echo "  phase=${PHASE}  evals=[${EVALS}]  eval_ckpts=${CHECKPOINTS}  gpu=${GPU}"
+echo "  phase=${PHASE}  evals=[${EVALS}]  eval_ckpts=${CHECKPOINTS}  gpu=${GPU}  seed=${SEED}"
 echo "  output=${OUTPUT_DIR}"
 echo "============================================================"
 
@@ -98,6 +99,7 @@ train_phase() {
         --n-checkpoints "${N_CHECKPOINTS}"
         --dtype         "${DTYPE}"
         --sae-dtype     "${SAE_DTYPE}"
+        --seed          "${SEED}"
         "${fp8_flag[@]}"
       )
       [[ -n "${TRAINING_TOKENS}" ]] && args+=( --training-tokens "${TRAINING_TOKENS}" )

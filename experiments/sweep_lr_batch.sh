@@ -60,12 +60,13 @@ MODEL="${MODEL:-gemma}"                        # one model (lr/batch dynamics st
 PRECISIONS="${PRECISIONS:-fp8}"                # "fp8", "fp16", or "fp16 fp8"
 WIDTH="${WIDTH:-65536}"
 K="${K:-80}"                                   # single representative sparsity
-LRS="${LRS:-1e-4 3e-4 1e-3}"
+LRS="${LRS:-1e-4 3e-4 1e-3 3e-3 1e-2}"
 BATCHES="${BATCHES:-2048 4096 8192 16384}"
 GROUP_SIZE="${GROUP_SIZE:-}"                   # "" raw; e.g. 2048 = ghost-batch control
 RUN_GROUP="${RUN_GROUP:-}"                     # extra run-tag prefix (e.g. "ghost"), keeps studies apart
 N_CHECKPOINTS="${N_CHECKPOINTS:-4}"            # 4 intermediate + final = 5 checkpoints (set 0 for final-only)
 GPU="${GPU:-0}"
+SEED="${SEED:-0}"                             # RNG seed for every train run (reproducible by default)
 PHASE="${PHASE:-all}"
 EVALS="${EVALS:-core,sparse_probing}"
 CHECKPOINTS="${CHECKPOINTS:-final}"            # final is the point for an lr/batch grid
@@ -102,7 +103,7 @@ echo "  lr x batch sweep   model=${MODEL}  precisions=[${PRECISIONS}]"
 echo "  width=${WIDTH}  k=${K}   lrs=[${LRS}]   batches=[${BATCHES}]"
 echo "  group_size=${GROUP_SIZE:-<none/raw>}  run_group=${RUN_GROUP:-<none>}"
 echo "  checkpoints=${N_CHECKPOINTS} (+final)  tokens=${TRAINING_TOKENS:-500M}"
-echo "  phase=${PHASE}  evals=[${EVALS}]  eval_ckpts=${CHECKPOINTS}  gpu=${GPU}"
+echo "  phase=${PHASE}  evals=[${EVALS}]  eval_ckpts=${CHECKPOINTS}  gpu=${GPU}  seed=${SEED}"
 echo "  output=${OUTPUT_DIR}"
 echo "============================================================"
 
@@ -135,6 +136,7 @@ train_phase() {
           --n-checkpoints "${N_CHECKPOINTS}"
           --dtype         "${DTYPE}"
           --sae-dtype     "${SAE_DTYPE}"
+          --seed          "${SEED}"
           "${fp8_flag[@]}"
         )
         [[ -n "${GROUP_SIZE}" ]]      && args+=( --topk-group-size "${GROUP_SIZE}" )

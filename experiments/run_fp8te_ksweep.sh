@@ -40,6 +40,7 @@ COMMON=(
   LOCAL_DATA="$DATA"
   DTYPE=bfloat16
   SAE_DTYPE=float32
+  SEED="${SEED:-0}"
 )
 # Optional TE recipe/scaling overrides (empty -> train_saebench_replication.py defaults:
 # recipe=hybrid, scaling=delayed, amax_history=16/max, margin=0, aux_loss=on).

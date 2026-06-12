@@ -20,10 +20,11 @@ PILE="${PILE:-/wekafs/smerrill/data/pile-uncopyrighted}"
 # Common knobs (override via env). GROUP_SIZE / RUN_GROUP pass through for the ghost variant.
 export MODEL="${MODEL:-gemma}" PRECISIONS="${PRECISIONS:-fp8te}"
 export WIDTH="${WIDTH:-65536}" K="${K:-80}"
-export LRS="${LRS:-1e-4 3e-4 1e-3}" BATCHES="${BATCHES:-2048 4096 8192 16384}"
+export LRS="${LRS:-1e-4 3e-4 1e-3 3e-3 1e-2}" BATCHES="${BATCHES:-2048 4096 8192 16384}"
 export TRAINING_TOKENS="${TRAINING_TOKENS:-100000000}" N_CHECKPOINTS="${N_CHECKPOINTS:-0}"
 export EVALS="${EVALS:-core,sparse_probing}" CHECKPOINTS="${CHECKPOINTS:-final}"
 export GPU="${GPU:-0}"
+export SEED="${SEED:-0}"
 
 echo "[fp8te-lrbs] $(date)  variant=${RUN_GROUP:-raw}  GPU=${GPU} HIP=${HIP_VISIBLE_DEVICES:-unset}"
 echo "[fp8te-lrbs] PHASE 1/2 TRAIN  (offline, local Pile=${PILE})"
