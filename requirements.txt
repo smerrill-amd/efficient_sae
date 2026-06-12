@@ -17,3 +17,18 @@ jupyterlab
 notebook
 ipykernel
 ipywidgets
+wordfreq  # content-word frequency gating for monosemantic concept discovery (steering_lib)
+# TransformerEngine fp8 (for the `batchtopk_te_fp8` SAE arch). DO NOT `pip install
+# transformer_engine[pytorch]` — the PyPI wheel is CUDA-only (needs NVCC) and pulls a
+# CUDA torch that clobbers this box's ROCm torch. Install the ROCm wheels instead
+# (prebuilt core lib for ROCm 7.2; only the small pytorch binding builds via hipcc).
+# Needs cmake (`pip install cmake`). Working recipe used here:
+#   pip install cmake
+#   mkdir -p /tmp/te_wheels && cd /tmp/te_wheels
+#   base=https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2
+#   for f in transformer_engine-2.4.0-py3-none-any.whl \
+#            transformer_engine_rocm-2.4.0-py3-none-manylinux_2_28_x86_64.whl \
+#            transformer_engine_torch-2.4.0.tar.gz; do curl -sO $base/$f; done
+#   NVTE_FRAMEWORK=pytorch NVTE_USE_ROCM=1 NVTE_ROCM_ARCH=gfx942 ROCM_PATH=/opt/rocm \
+#     NVTE_FUSED_ATTN=0 pip install --no-build-isolation ./transformer_engine*.whl ./transformer_engine_torch-*.tar.gz
+# Left out of the pip line above so setup_rocm_sae_env.sh can't break torch.

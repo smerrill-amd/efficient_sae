@@ -78,6 +78,44 @@ fi
 echo "Installing python dependencies from ${REQ_FILE}..."
 "${PYTHON}" -m pip install -r "${REQ_FILE}"
 
+# ---------------------------------------------------------------------------
+# TransformerEngine (ROCm) — required for the `batchtopk_te_fp8` SAE arch.
+# IMPORTANT: do NOT `pip install transformer_engine[pytorch]` — that PyPI wheel is
+# CUDA-only (needs NVCC) and pulls a CUDA build of torch that clobbers this box's
+# ROCm torch. We install AMD's prebuilt ROCm wheels instead (core lib prebuilt;
+# only the small pytorch binding builds via hipcc). Idempotent: skipped if TE's
+# pytorch binding already imports. Override version/release via TE_VERSION /
+# TE_ROCM_REL; non-fatal if it fails (the fp8-te arch is simply unavailable).
+# ---------------------------------------------------------------------------
+TE_ROCM_REL="${TE_ROCM_REL:-rocm-rel-7.2}"
+TE_VERSION="${TE_VERSION:-2.4.0}"
+if "${PYTHON}" -c "import transformer_engine.pytorch" >/dev/null 2>&1; then
+  echo "TransformerEngine already installed — skipping."
+else
+  echo "Installing TransformerEngine (ROCm wheels, ${TE_ROCM_REL} v${TE_VERSION})..."
+  "${PYTHON}" -m pip install -q cmake
+  TE_DL="$(mktemp -d)"
+  TE_BASE="https://repo.radeon.com/rocm/manylinux/${TE_ROCM_REL}"
+  te_ok=1
+  for f in "transformer_engine-${TE_VERSION}-py3-none-any.whl" \
+           "transformer_engine_rocm-${TE_VERSION}-py3-none-manylinux_2_28_x86_64.whl" \
+           "transformer_engine_torch-${TE_VERSION}.tar.gz"; do
+    curl -fsSL -o "${TE_DL}/${f}" "${TE_BASE}/${f}" \
+      || { echo "  WARNING: could not download ${f} from ${TE_BASE}"; te_ok=0; }
+  done
+  if [[ "${te_ok}" == "1" ]]; then
+    NVTE_FRAMEWORK=pytorch NVTE_USE_ROCM=1 NVTE_ROCM_ARCH="${NVTE_ROCM_ARCH:-gfx942}" \
+      ROCM_PATH="${ROCM_PATH:-/opt/rocm}" NVTE_FUSED_ATTN="${NVTE_FUSED_ATTN:-0}" \
+      "${PYTHON}" -m pip install --no-build-isolation \
+        "${TE_DL}/transformer_engine-${TE_VERSION}-py3-none-any.whl" \
+        "${TE_DL}/transformer_engine_rocm-${TE_VERSION}-py3-none-manylinux_2_28_x86_64.whl" \
+        "${TE_DL}/transformer_engine_torch-${TE_VERSION}.tar.gz" \
+      && echo "TransformerEngine installed (ROCm)." \
+      || echo "  WARNING: TransformerEngine install failed — fp8-te arch will be unavailable."
+  fi
+  rm -rf "${TE_DL}"
+fi
+
 echo "Validating ROCm and SAELens..."
 "${PYTHON}" -c "import torch, sae_lens; print('torch:', torch.__version__); print('sae_lens:', sae_lens.__version__); print('cuda_available:', torch.cuda.is_available()); print('gpu_count:', torch.cuda.device_count())"
 
