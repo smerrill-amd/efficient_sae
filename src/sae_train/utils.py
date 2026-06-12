@@ -6,9 +6,55 @@ precision-aware code lives in precision.py and the per-precision entrypoints.
 """
 
 import os
+import random
 import re
 from datetime import datetime
 from pathlib import Path
+
+# Default RNG seed applied to EVERY training run unless --seed overrides it. Kept
+# consistent with experiments/train_saebench_replication.py so all SAE training in
+# this repo is reproducible by default.
+DEFAULT_SEED = 0
+
+
+def set_seed(seed: int = DEFAULT_SEED) -> None:
+    """Seed every RNG that influences an SAELens training run.
+
+    SAELens does NOT consume its config ``seed`` in the LLM/multi-SAE training path;
+    the two random draws that matter both pull from the *global* torch RNG:
+      * SAE weight init (``nn.init.kaiming_uniform_`` on ``W_dec``; ``W_enc`` is a
+        transposed copy, biases are zeros), once per SAE in dict order.
+      * The activation mixing buffer (``torch.randperm`` reshuffles on every refill).
+    Seeding the global torch RNG here makes both reproducible; we also seed
+    python/numpy and pin ``PYTHONHASHSEED``.
+    """
+    import numpy as np
+    import torch
+
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def enable_determinism() -> None:
+    """Force deterministic CUDA kernels (slower, but bit-reproducible runs).
+
+    Seeding alone is not enough on GPU: cuBLAS/cuDNN pick nondeterministic kernels
+    and TF32 changes numerics run-to-run. ``CUBLAS_WORKSPACE_CONFIG`` must be set
+    before the first cuBLAS handle; we set it here (best-effort) and recommend also
+    exporting it in the shell.
+    """
+    import torch
+
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+
 
 # Hook-name abbreviations used in run names / wandb tags.
 HOOK_ABBREV = {

@@ -11,6 +11,7 @@ import argparse
 from pathlib import Path
 
 from sae_train.precision import PrecisionPolicy
+from sae_train.utils import DEFAULT_SEED
 
 # Repo root = three levels up from src/sae_train/cli.py
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -183,7 +184,16 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
                           "run sequentially per SAE, so raise this when sweeping many SAEs.")
     out.add_argument("--no-wandb", action="store_true",
                      help="Disable Weights & Biases logging")
-    out.add_argument("--seed", type=int, default=42)
+    out.add_argument("--seed", type=int, default=DEFAULT_SEED,
+                     help="Global RNG seed, applied to python/numpy/torch before the "
+                          "runner builds SAEs so weight init AND the activation "
+                          "mixing-buffer shuffle are reproducible. Always on by "
+                          f"default (SAELens' own config 'seed' is a no-op in training).")
+    out.add_argument("--deterministic", action="store_true", default=False,
+                     help="Also force deterministic CUDA kernels (cuDNN deterministic, "
+                          "no TF32, torch.use_deterministic_algorithms) for bit-identical "
+                          "runs across processes. Costs throughput; sets "
+                          "CUBLAS_WORKSPACE_CONFIG=:4096:8 (also export it in the shell).")
     out.add_argument("--run-name", default=None,
                      help="Override the auto-generated run name")
 

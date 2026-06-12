@@ -35,10 +35,12 @@ from sae_train.utils import (
     build_run_name,
     configure_wandb_env,
     dump_resolved_cfg,
+    enable_determinism,
     fmt_duration,
     layer_from_hook,
     maybe_load_dataset,
     parse_int_list,
+    set_seed,
 )
 
 
@@ -367,6 +369,15 @@ def run_multi(args, policy: PrecisionPolicy) -> None:
 
 def dispatch(args, policy: PrecisionPolicy) -> None:
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+    # Seed BEFORE anything builds SAEs / the activation buffer (both use the global
+    # torch RNG). Always on so every training run is reproducible by default;
+    # --deterministic additionally pins CUDA kernels for bit-identical runs.
+    if getattr(args, "deterministic", False):
+        enable_determinism()
+    set_seed(args.seed)
+    print(f"[repro] seed={args.seed}"
+          + ("  [deterministic CUDA]" if getattr(args, "deterministic", False) else ""))
 
     if not torch.cuda.is_available():
         print("WARNING: CUDA/ROCm not detected — training on CPU will be very slow.",

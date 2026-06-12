@@ -47,6 +47,8 @@ to launch gemma on GPU 0 and pythia on GPU 1 simultaneously.
 from __future__ import annotations
 
 import argparse
+import os
+import random
 import sys
 from pathlib import Path
 
@@ -111,6 +113,50 @@ MODEL_SPECS = {
         default_gpu=1,
     ),
 }
+
+
+def set_seed(seed: int) -> None:
+    """Seed every RNG that influences an SAELens training run.
+
+    SAELens does NOT consume its config ``seed`` field in the LLM/multi-SAE
+    training path — the two random draws that matter both pull from the *global*
+    torch RNG:
+      * SAE weight init: ``nn.init.kaiming_uniform_`` on ``W_dec`` (``W_enc`` is a
+        transposed copy; biases are zeros), once per SAE in dict order.
+      * The activation mixing buffer: ``torch.randperm`` reshuffles the buffer on
+        every refill (``activations_mixing_fraction`` > 0).
+    Seeding the global torch RNG here therefore makes both reproducible. We also
+    seed python/numpy and pin ``PYTHONHASHSEED`` for good measure.
+    """
+    import numpy as np
+    import torch
+
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def enable_determinism() -> None:
+    """Force deterministic CUDA kernels (slower, but bit-reproducible runs).
+
+    Seeding the RNG is necessary but not sufficient on GPU: cuBLAS/cuDNN pick
+    nondeterministic kernels and TF32 changes numerics run-to-run. This pins all
+    of that. ``CUBLAS_WORKSPACE_CONFIG`` must be set before the first cuBLAS
+    handle is created; we set it here (before any training matmul) and also
+    recommend exporting it in the shell to be safe.
+    """
+    import torch
+
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    # warn_only: a few ops (e.g. the aux dead-feature scatter) lack deterministic
+    # kernels; we don't want those to hard-crash a long run.
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
 
 
 def build_saes(d_in: int, widths: list[int], ks: list[int], device: str,
@@ -273,6 +319,16 @@ def parse_args() -> argparse.Namespace:
                         "other. Empty = the plain saebench_<model>[_fp8] dir.")
     p.add_argument("--training-tokens", type=int, default=TRAINING_TOKENS,
                    help="Override the token budget (default: SAEBench's 500M).")
+    p.add_argument("--seed", type=int, default=SEED,
+                   help=f"Global RNG seed (default: {SEED}). Seeds python/numpy/torch "
+                        "BEFORE the runner builds the SAEs, so weight init AND the "
+                        "activation mixing-buffer shuffle are reproducible (SAELens' own "
+                        "config 'seed' field is a no-op in the training path).")
+    p.add_argument("--deterministic", action="store_true", default=False,
+                   help="Also force deterministic CUDA kernels (cuDNN deterministic, "
+                        "no TF32, torch.use_deterministic_algorithms). Needed for "
+                        "bit-identical runs across processes; costs throughput. Sets "
+                        "CUBLAS_WORKSPACE_CONFIG=:4096:8 (also export it in the shell).")
     p.add_argument("--n-checkpoints", type=int, default=0,
                    help="Intermediate checkpoints per SAE (0 = none; final is still saved).")
     p.add_argument("--no-save-final", action="store_true",
@@ -335,6 +391,12 @@ def build_local_dataset(local_data: str):
 def main() -> None:
     args = parse_args()
     spec = MODEL_SPECS[args.model]
+
+    # Seed BEFORE anything builds SAEs / the activation buffer (both use the global
+    # torch RNG). --deterministic additionally pins CUDA kernels for bit-repro runs.
+    if args.deterministic:
+        enable_determinism()
+    set_seed(args.seed)
 
     gpu = args.gpu if args.gpu is not None else spec["default_gpu"]
     device = f"cuda:{gpu}"
@@ -429,7 +491,8 @@ def main() -> None:
     print(f"  lr          {lr}  warmup={warmup_steps}  decay_steps={decay_steps} (last {DECAY_FRACTION:.0%})")
     print(f"  aux_coeff   {AUX_LOSS_COEFFICIENT}  topk_threshold_lr={TOPK_THRESHOLD_LR}")
     print(f"  dataset     {args.dataset}")
-    print(f"  batch/ctx   {batch_tokens} tokens / {CONTEXT_SIZE} ctx   seed={SEED}")
+    print(f"  batch/ctx   {batch_tokens} tokens / {CONTEXT_SIZE} ctx   seed={args.seed}"
+          f"{'  [deterministic CUDA]' if args.deterministic else ''}")
     if args.fp8_te:
         prec = (f"FP8-TE (recipe={args.fp8_recipe}, scaling={args.fp8_scaling}, "
                 f"amax_hist={args.amax_history_len}/{args.amax_compute_algo}, "
@@ -498,7 +561,7 @@ def main() -> None:
         eval_batch_size_prompts=eval_batch_size_prompts,
         device=device,
         llm_device=device,
-        seed=SEED,
+        seed=args.seed,
         dtype=args.dtype,
         autocast=sae_autocast,
         autocast_lm=True,
