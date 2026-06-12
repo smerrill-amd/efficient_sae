@@ -63,6 +63,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 from architectures import (  # noqa: E402  (importing registers the fp8 + grouped archs)
     BatchTopKFP8TrainingSAEConfig,
+    BatchTopKTEFP8TrainingSAEConfig,
     GroupedBatchTopKTrainingSAEConfig,
 )
 from architectures.fp8_formats import get_format  # noqa: E402
@@ -115,7 +116,11 @@ MODEL_SPECS = {
 def build_saes(d_in: int, widths: list[int], ks: list[int], device: str,
                sae_dtype: str, fp8: bool = False, fp8_format: str = "e4m3",
                fp8_backend: str = "hardware", fp8_quantize_grads: bool = False,
-               topk_group_size: int = 0
+               topk_group_size: int = 0,
+               fp8_te: bool = False, te_recipe: str = "hybrid",
+               te_scaling: str = "delayed", te_amax_history_len: int = 16,
+               te_amax_compute_algo: str = "max", te_margin: int = 0,
+               te_aux_loss: bool = True,
                ) -> dict[str, BatchTopKTrainingSAEConfig]:
     """One BatchTopK config per (width, k), all sharing the same hook.
 
@@ -146,7 +151,20 @@ def build_saes(d_in: int, widths: list[int], ks: list[int], device: str,
                 dtype=sae_dtype,
                 device=device,
             )
-            if fp8:
+            if fp8_te:
+                # TransformerEngine BatchTopK: encoder/decoder are te.Linear run under
+                # te.fp8_autocast with the chosen recipe (hybrid + delayed scaling by
+                # default). Every other hyperparameter matches the FP16/SAEBench recipe.
+                saes[name] = BatchTopKTEFP8TrainingSAEConfig(
+                    fp8_recipe=te_recipe,
+                    fp8_scaling=te_scaling,
+                    delayed_amax_history_len=te_amax_history_len,
+                    delayed_amax_compute_algo=te_amax_compute_algo,
+                    margin=te_margin,
+                    fp8_aux_loss=te_aux_loss,
+                    **common,
+                )
+            elif fp8:
                 saes[name] = BatchTopKFP8TrainingSAEConfig(
                     fp8_format=fp8_format,
                     fp8_backend=fp8_backend,
@@ -175,6 +193,17 @@ def parse_args() -> argparse.Namespace:
                    default=Path(__file__).resolve().parent / "results",
                    help="Root dir for the run (a saebench_<model>/ subdir is created).")
     p.add_argument("--dataset", default=DATASET, help="HF dataset path (activation source).")
+    p.add_argument("--local-data", default="",
+                   help="Path to a LOCAL copy of the dataset (a .jsonl/.jsonl.zst file, "
+                        "a glob, or a dir of them). When set, the run reads activations "
+                        "from disk via the 'json' loader instead of streaming from HF — "
+                        "immune to mid-run network/DNS drops. A single Pile shard "
+                        "(~11GB) holds far more than the 500M-token budget.")
+    p.add_argument("--resume-from", default="",
+                   help="Resume training from a checkpoint: 'auto' (latest checkpoint "
+                        "under the run dir) or an explicit <run>/checkpoints/<hash>/<step> "
+                        "path. Restores per-SAE weights + optimizer + step + dataset "
+                        "position, then continues to --training-tokens.")
     p.add_argument("--dtype", default="bfloat16",
                    choices=["bfloat16", "float16", "float32"],
                    help="Activation/buffer dtype.")
@@ -197,6 +226,26 @@ def parse_args() -> argparse.Namespace:
                         "emulated: software fake-quant (any format). Default hardware.")
     g.add_argument("--fp8-quantize-grads", action="store_true", default=False,
                    help="Also quantize gradients to fp8 (approximate fully-fp8 training).")
+    te = p.add_argument_group("FP8 TransformerEngine training (optional)")
+    te.add_argument("--fp8-te", action="store_true", default=False,
+                    help="Train the batchtopk_te_fp8 SAE: encoder/decoder are "
+                         "transformer_engine te.Linear run under te.fp8_autocast with "
+                         "the recipe below. Implies fp8 (autocast off, --dtype==--sae-dtype) "
+                         "and overrides the --fp8 (non-TE) path. Output dir suffix _fp8te.")
+    te.add_argument("--fp8-recipe", default="hybrid", choices=["hybrid", "e4m3", "e5m2"],
+                    help="TE fp8 format recipe (default: hybrid = e4m3 fwd / e5m2 bwd).")
+    te.add_argument("--fp8-scaling", default="delayed", choices=["delayed", "current"],
+                    help="TE fp8 scaling. delayed = DelayedScaling w/ amax history; "
+                         "current = per-tensor dynamic (try this if delayed diverges).")
+    te.add_argument("--amax-history-len", type=int, default=16, dest="amax_history_len",
+                    help="DelayedScaling amax history length (default 16).")
+    te.add_argument("--amax-compute-algo", default="max", dest="amax_compute_algo",
+                    help="DelayedScaling amax compute algo: 'max' or 'most_recent'.")
+    te.add_argument("--margin", type=int, default=0, help="DelayedScaling margin (default 0).")
+    te.add_argument("--no-fp8-aux-loss", action="store_false", dest="fp8_aux_loss",
+                    default=True,
+                    help="Disable the TE-path aux (dead-feature) loss; default ON to keep "
+                         "the aux reconstruction on the TE GEMM path.")
     p.add_argument("--widths", default=None,
                    help="Comma list of widths to train (default: 4096,16384,65536). "
                         "Drop the 65k width here if you OOM.")
@@ -236,6 +285,53 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def find_latest_checkpoint(run_dir: Path) -> Path | None:
+    """Latest resumable checkpoint under ``run_dir/checkpoints/<hash>/<step>/``.
+
+    A resumable checkpoint dir holds the runner-level ``activations_store_state``
+    file plus a per-SAE subdir each. We pick the one with the largest integer
+    step name.
+    """
+    import glob as _glob
+
+    ckpt_root = run_dir / "checkpoints"
+    if not ckpt_root.exists():
+        return None
+    best_step, best = -1, None
+    for state in _glob.glob(str(ckpt_root / "*" / "*" / "activations_store_state.safetensors")):
+        d = Path(state).parent
+        try:
+            step = int(d.name)
+        except ValueError:
+            continue
+        if step > best_step:
+            best_step, best = step, d
+    return best
+
+
+def build_local_dataset(local_data: str):
+    """A streaming IterableDataset over local .jsonl(.zst) files (no network).
+
+    Accepts a single file, a directory (all *.jsonl/*.jsonl.zst inside), or a glob.
+    """
+    import glob as _glob
+
+    p = Path(local_data)
+    if p.is_dir():
+        files = sorted(str(f) for pat in ("*.jsonl", "*.jsonl.zst", "*.json", "*.json.zst")
+                       for f in p.rglob(pat))
+    else:
+        files = sorted(_glob.glob(local_data))
+    if not files:
+        raise SystemExit(f"--local-data {local_data!r} matched no .jsonl(.zst) files.")
+    from datasets import load_dataset
+
+    print(f"  local data  {len(files)} file(s) via 'json' loader (no streaming from HF):")
+    for f in files[:4]:
+        print(f"                {f}")
+    return load_dataset("json", data_files=files, split="train", streaming=True)
+
+
 def main() -> None:
     args = parse_args()
     spec = MODEL_SPECS[args.model]
@@ -245,12 +341,13 @@ def main() -> None:
     widths = [int(x) for x in args.widths.split(",")] if args.widths else [2 ** p for p in WIDTH_POWS]
     ks = [int(x) for x in args.ks.split(",")] if args.ks else list(K_VALUES)
 
-    if args.fp8:
+    if args.fp8 or args.fp8_te:
         # fp8 manages precision explicitly inside the GEMM (no SAELens autocast), so the
         # activation and master dtypes must match (else the bf16-acts/fp32-weights MSE
         # crashes). Coerce --dtype to the master --sae-dtype (default float32 = fp32
         # master, same as the FP16 baseline). Pass --sae-dtype bfloat16 for a bf16 master.
-        get_format(args.fp8_format)  # validate the format string early
+        if args.fp8 and not args.fp8_te:
+            get_format(args.fp8_format)  # validate the (non-TE) format string early
         if args.dtype != args.sae_dtype:
             print(f"[fp8] coercing --dtype {args.dtype} -> {args.sae_dtype} "
                   "(fp8 disables autocast; activation/master dtypes must match).")
@@ -261,16 +358,39 @@ def main() -> None:
                       fp8=args.fp8, fp8_format=args.fp8_format,
                       fp8_backend=args.fp8_backend,
                       fp8_quantize_grads=args.fp8_quantize_grads,
-                      topk_group_size=args.topk_group_size)
+                      topk_group_size=args.topk_group_size,
+                      fp8_te=args.fp8_te, te_recipe=args.fp8_recipe,
+                      te_scaling=args.fp8_scaling,
+                      te_amax_history_len=args.amax_history_len,
+                      te_amax_compute_algo=args.amax_compute_algo,
+                      te_margin=args.margin, te_aux_loss=args.fp8_aux_loss)
     hook_names = {name: hook_name for name in saes}
 
     # Separate output tree for fp8 so it never clobbers the FP16 baseline results.
     # An optional --run-tag further separates sweep points (lr/batch grid). The fp8
     # suffix alone keys the W&B *project*; the tag only distinguishes runs within it.
-    fp8_suffix = "_fp8" if args.fp8 else ""
+    fp8_suffix = "_fp8te" if args.fp8_te else ("_fp8" if args.fp8 else "")
     run_suffix = fp8_suffix + (f"_{args.run_tag}" if args.run_tag else "")
     run_dir = args.output_dir / f"saebench_{args.model}{run_suffix}"
     run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Resolve --resume-from ('auto' -> latest checkpoint under this run dir).
+    resume_path: Path | None = None
+    if args.resume_from:
+        if args.resume_from == "auto":
+            resume_path = find_latest_checkpoint(run_dir)
+            if resume_path is None:
+                raise SystemExit(
+                    f"--resume-from auto: no checkpoint found under {run_dir}/checkpoints. "
+                    "Train at least one checkpoint first, or pass an explicit path."
+                )
+        else:
+            resume_path = Path(args.resume_from)
+            if not (resume_path / "activations_store_state.safetensors").exists():
+                raise SystemExit(
+                    f"--resume-from {resume_path}: not a resumable checkpoint "
+                    "(missing activations_store_state.safetensors)."
+                )
 
     # Batch size and LR are sweepable; re-derive the (token-defined) schedule for the
     # chosen batch so warmup/decay cover the same token budget regardless of batch size.
@@ -310,11 +430,22 @@ def main() -> None:
     print(f"  aux_coeff   {AUX_LOSS_COEFFICIENT}  topk_threshold_lr={TOPK_THRESHOLD_LR}")
     print(f"  dataset     {args.dataset}")
     print(f"  batch/ctx   {batch_tokens} tokens / {CONTEXT_SIZE} ctx   seed={SEED}")
-    prec = (f"FP8 ({args.fp8_format}, backend={args.fp8_backend}, "
-            f"quant_grads={args.fp8_quantize_grads})" if args.fp8 else "FP16/bf16")
+    if args.fp8_te:
+        prec = (f"FP8-TE (recipe={args.fp8_recipe}, scaling={args.fp8_scaling}, "
+                f"amax_hist={args.amax_history_len}/{args.amax_compute_algo}, "
+                f"margin={args.margin}, aux_loss={args.fp8_aux_loss})")
+    elif args.fp8:
+        prec = (f"FP8 ({args.fp8_format}, backend={args.fp8_backend}, "
+                f"quant_grads={args.fp8_quantize_grads})")
+    else:
+        prec = "FP16/bf16"
     print(f"  precision   {prec}")
     print(f"  device      {device}   acts={args.dtype}  sae={args.sae_dtype}")
     print(f"  eval batch  {eval_batch_size_prompts} prompts (BatchTopK INT_MAX-safe for d_sae<={max_d_sae})")
+    if resume_path is not None:
+        print(f"  RESUME      {resume_path}  (step {resume_path.name})")
+    if args.local_data:
+        print(f"  data src    LOCAL {args.local_data}  (no HF streaming)")
     print(f"  output      {run_dir}")
     print("=" * 70)
 
@@ -334,13 +465,18 @@ def main() -> None:
     logger_cfg = LoggingConfig(
         log_to_wandb=not args.no_wandb,
         wandb_project=wandb_project,
-        run_name=f"saebench_{args.model}{run_suffix}_batchtopk_allwidths_allk",
+        # Reflect the ACTUAL grid: single width/k -> w{W}_k{K}; otherwise allwidths/allk.
+        run_name=(
+            f"saebench_{args.model}{run_suffix}_batchtopk_"
+            f"{('w%d' % widths[0]) if len(widths) == 1 else 'allwidths'}_"
+            f"{('k%d' % ks[0]) if len(ks) == 1 else 'allk'}"
+        ),
     )
 
     # FP8 manages precision explicitly inside the GEMM -> no SAELens autocast/GradScaler.
     # FP16: float32 SAE weights keep the AMP GradScaler path (autocast matmuls in bf16);
     # native bf16 weights disable it (no bf16 kernel for unscale).
-    sae_autocast = (not args.fp8) and (args.sae_dtype != "bfloat16")
+    sae_autocast = (not args.fp8) and (not args.fp8_te) and (args.sae_dtype != "bfloat16")
 
     cfg = MultiSAETrainingRunnerConfig(
         saes=saes,
@@ -370,11 +506,14 @@ def main() -> None:
         checkpoint_path=str(run_dir / "checkpoints"),
         output_path=str(run_dir),
         save_final_checkpoint=not args.no_save_final,
+        resume_from_checkpoint=str(resume_path) if resume_path is not None else None,
         logger=logger_cfg,
     )
 
+    override_dataset = build_local_dataset(args.local_data) if args.local_data else None
+
     print(f"\nStarting shared-model run over {len(saes)} SAEs on {device} ...\n")
-    MultiSAETrainingRunner(cfg).run()
+    MultiSAETrainingRunner(cfg, override_dataset=override_dataset).run()
     print(f"\nDone. Outputs under: {run_dir}")
 
 

@@ -48,14 +48,24 @@ EVALS="${EVALS:-core,sparse_probing}"
 CHECKPOINTS="${CHECKPOINTS:-all}"             # 'all' (5/ckpt, evolution) or 'final' (fast frontier)
 SAE_DTYPE="${SAE_DTYPE:-float32}"
 DTYPE="${DTYPE:-bfloat16}"
+FP8_SCALING="${FP8_SCALING:-}"               # TE only: override scaling (delayed|current)
+FP8_RECIPE="${FP8_RECIPE:-}"                 # TE only: override recipe  (hybrid|e4m3|e5m2)
 TRAINING_TOKENS="${TRAINING_TOKENS:-}"        # empty -> SAEBench 500M
+LOCAL_DATA="${LOCAL_DATA:-}"                  # local .jsonl(.zst) path/dir -> no HF streaming (network-blip proof)
+RESUME="${RESUME:-}"                          # 'auto' (latest ckpt under run dir) or explicit ckpt path
 OUTPUT_DIR="${OUTPUT_DIR:-${SCRIPT_DIR}/results}"
 DRY_RUN="${DRY_RUN:-0}"
 
 TS="$(date +%Y%m%d_%H%M%S)"
 
-# fp16/fp8 -> the run-dir suffix train_saebench_replication.py produces.
-suffix_for() { [[ "$1" == "fp8" ]] && echo "_fp8" || echo ""; }
+# precision -> the run-dir suffix train_saebench_replication.py produces.
+suffix_for() {
+  case "$1" in
+    fp8te) echo "_fp8te" ;;   # TransformerEngine fp8 path  (--fp8-te)
+    fp8)   echo "_fp8" ;;     # torch._scaled_mm/emulated fp8 path (--fp8)
+    *)     echo "" ;;          # fp16/bf16 baseline
+  esac
+}
 
 echo "============================================================"
 echo "  k-sweep  models=[${MODELS}]  precisions=[${PRECISIONS}]"
@@ -68,7 +78,15 @@ echo "============================================================"
 train_phase() {
   for model in ${MODELS}; do
     for prec in ${PRECISIONS}; do
-      local fp8_flag=(); [[ "${prec}" == "fp8" ]] && fp8_flag=( --fp8 )
+      local fp8_flag=()
+      case "${prec}" in
+        fp8te)
+          fp8_flag=( --fp8-te )
+          [[ -n "${FP8_SCALING}" ]] && fp8_flag+=( --fp8-scaling "${FP8_SCALING}" )
+          [[ -n "${FP8_RECIPE}" ]]  && fp8_flag+=( --fp8-recipe "${FP8_RECIPE}" )
+          ;;
+        fp8) fp8_flag=( --fp8 ) ;;
+      esac
       local sfx; sfx="$(suffix_for "${prec}")"
       local log="${OUTPUT_DIR}/sweepk_train_${model}_${prec}_${TS}.log"
       local args=(
@@ -83,6 +101,8 @@ train_phase() {
         "${fp8_flag[@]}"
       )
       [[ -n "${TRAINING_TOKENS}" ]] && args+=( --training-tokens "${TRAINING_TOKENS}" )
+      [[ -n "${LOCAL_DATA}" ]]      && args+=( --local-data "${LOCAL_DATA}" )
+      [[ -n "${RESUME}" ]]          && args+=( --resume-from "${RESUME}" )
       [[ "${DRY_RUN}" == "1" ]]     && args+=( --dry-run )
       echo ""
       echo ">>> TRAIN ${model}/${prec}  -> results/saebench_${model}${sfx}  (log: ${log})"
@@ -108,8 +128,13 @@ eval_phase() {
       fi
       for k in "${KARR[@]}"; do
         local member="w${WIDTH}_k${k}"
-        if [[ ! -d "${run_dir}/${member}" ]]; then
-          echo ">>> SKIP ${model}/${prec}/${member}: not trained"
+        # The member is evaluable if it exists either as the top-level final
+        # export (<run>/<member>) OR inside any checkpoint dir
+        # (<run>/checkpoints/<hash>/<step>/<member>) — runs that crashed before
+        # the final export still have checkpoint members eval_saebench.sh can load.
+        if [[ ! -d "${run_dir}/${member}" ]] \
+           && ! compgen -G "${run_dir}/checkpoints/*/*/${member}" > /dev/null; then
+          echo ">>> SKIP ${model}/${prec}/${member}: not trained (no export or checkpoint)"
           continue
         fi
         echo ""

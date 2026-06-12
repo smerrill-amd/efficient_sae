@@ -72,13 +72,20 @@ CHECKPOINTS="${CHECKPOINTS:-final}"            # final is the point for an lr/ba
 SAE_DTYPE="${SAE_DTYPE:-float32}"
 DTYPE="${DTYPE:-bfloat16}"
 TRAINING_TOKENS="${TRAINING_TOKENS:-}"         # empty -> SAEBench 500M
+LOCAL_DATA="${LOCAL_DATA:-}"                    # local .jsonl(.zst) path -> no HF streaming (disconnect-proof)
 OUTPUT_DIR="${OUTPUT_DIR:-${SCRIPT_DIR}/results}"
 DRY_RUN="${DRY_RUN:-0}"
 
 TS="$(date +%Y%m%d_%H%M%S)"
 
-# fp16/fp8 -> the run-dir suffix train_saebench_replication.py produces.
-suffix_for() { [[ "$1" == "fp8" ]] && echo "_fp8" || echo ""; }
+# precision -> the run-dir suffix train_saebench_replication.py produces.
+suffix_for() {
+  case "$1" in
+    fp8te) echo "_fp8te" ;;   # TransformerEngine fp8 path (--fp8-te)
+    fp8)   echo "_fp8" ;;     # torch._scaled_mm/emulated fp8 path (--fp8)
+    *)     echo "" ;;          # fp16/bf16 baseline
+  esac
+}
 
 # run-tag for a grid cell: [<group>_]lr<lr>_bs<bs>[_g<group_size>]
 # Encodes everything the notebook needs to parse back out of the dir name.
@@ -102,7 +109,15 @@ echo "============================================================"
 # ── Train phase ───────────────────────────────────────────────────────────────
 train_phase() {
   for prec in ${PRECISIONS}; do
-    local fp8_flag=(); [[ "${prec}" == "fp8" ]] && fp8_flag=( --fp8 )
+    local fp8_flag=()
+    case "${prec}" in
+      fp8te)
+        fp8_flag=( --fp8-te )
+        [[ -n "${FP8_SCALING:-}" ]] && fp8_flag+=( --fp8-scaling "${FP8_SCALING}" )
+        [[ -n "${FP8_RECIPE:-}" ]]  && fp8_flag+=( --fp8-recipe "${FP8_RECIPE}" )
+        ;;
+      fp8) fp8_flag=( --fp8 ) ;;
+    esac
     local sfx; sfx="$(suffix_for "${prec}")"
     for lr in ${LRS}; do
       for bs in ${BATCHES}; do
@@ -124,6 +139,7 @@ train_phase() {
         )
         [[ -n "${GROUP_SIZE}" ]]      && args+=( --topk-group-size "${GROUP_SIZE}" )
         [[ -n "${TRAINING_TOKENS}" ]] && args+=( --training-tokens "${TRAINING_TOKENS}" )
+        [[ -n "${LOCAL_DATA}" ]]      && args+=( --local-data "${LOCAL_DATA}" )
         [[ "${DRY_RUN}" == "1" ]]     && args+=( --dry-run )
         echo ""
         echo ">>> TRAIN ${prec} lr=${lr} bs=${bs}  -> results/saebench_${MODEL}${sfx}_${tag}  (log: ${log})"
